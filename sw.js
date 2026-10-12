@@ -1,5 +1,5 @@
 /* Offline support: on install, cache the page plus every script it loads; afterwards serve from the cache and refresh in the background. */
-const CACHE = "algo-arcade-v1";
+const CACHE = "algo-arcade-v2";
 const CORE = ["./", "index.html", "manifest.webmanifest", "icons/icon.svg", "icons/icon-180.png", "icons/icon-192.png", "icons/icon-512.png"];
 
 self.addEventListener("install", (e) => {

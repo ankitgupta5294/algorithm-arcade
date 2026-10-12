@@ -9,3 +9,7 @@ On your phone, open the link once, then *Add to Home Screen* (Safari: Share → 
 After that it works with no internet.
 
 Source of truth: `dsa_game/` in the `ai_projects` repo.
+
+## Systems Lab
+
+Real-world engineering scenarios (Linux, performance, networking, data engineering, Postgres, Redis, Elasticsearch, Kafka, distributed systems, system design, Kubernetes and more), each with Junior, Senior and Staff levels, played hands-on against simulators: terminals, config tuners, transaction interleavers, code and SQL editors, diff reviews. Postgres levels run real SQL in the browser via PGlite. More chapters are being added.

@@ -30,6 +30,7 @@
   });
 
   const GROUPS = [
+    { id: "Engineering", note: "Real-world systems scenarios: debug, tune, design and ship against simulators." },
     { id: "Drills", note: "Hand-written problems, rotated so you see new ones first." },
     { id: "Simulators", note: "Generated fresh every round, so they never run out." },
     { id: "Puzzles", note: "Hands-on games where you are the algorithm." },
@@ -60,7 +61,7 @@
       <header class="hero">
         <div class="eyebrow">Data structures &amp; algorithms · ${D.modes.length} games · 4 levels</div>
         <h1>Algorithm Arcade<span class="o" aria-hidden="true"> O(1)</span></h1>
-        <p class="lede">${D.pb ? `<b>${D.pb.list.length.toLocaleString()} hands-on problems</b> with three levels each, ` : ""}${handwritten} hand-written problems, and generators that build fresh stacks, heaps, trees, graphs and DP tables every round. Pick a level and play.</p>
+        <p class="lede">${D.lab && D.lab.list.length ? `<b>Systems Lab: ${D.lab.list.length.toLocaleString()} real-world engineering scenarios</b>, ` : ""}${D.pb ? `<b>${D.pb.list.length.toLocaleString()} hands-on problems</b> with three levels each, ` : ""}${handwritten} hand-written problems, and generators that build fresh stacks, heaps, trees, graphs and DP tables every round. Pick a level and play.</p>
       </header>
 
       <section class="profile" aria-label="Your progress on this device">
@@ -125,7 +126,7 @@
     const s = D.progress.get(m.id, level);
     if (m.noBadges) {
       return `<button type="button" class="mode-card${m.featured ? " featured" : ""}" data-mode="${m.id}">
-      <span class="mc-top"><span class="mc-topic">${U.esc(m.topic)}</span><span class="mc-topic">★ ${D.pb ? (D.pb.list.length * 3).toLocaleString() + " levels" : ""}</span></span>
+      <span class="mc-top"><span class="mc-topic">${U.esc(m.topic)}</span><span class="mc-topic">★ ${m.levelsLabel ? m.levelsLabel() : D.pb ? (D.pb.list.length * 3).toLocaleString() + " levels" : ""}</span></span>
       <span class="mc-name">${U.esc(m.name)}</span>
       <span class="mc-blurb">${U.esc(m.blurb)}</span>
       <span class="mc-foot"><span>${m.footer ? m.footer() : ""}</span><span>Open</span></span>
@@ -207,6 +208,7 @@
   const fromHash = location.hash.slice(1);
   if (D.modes.some((m) => m.id === fromHash)) open(fromHash, level);
   else if (D.pb && D.pb.byId.has(fromHash)) open("problems", level, { startProblem: fromHash });
+  else if (D.lab && (D.lab.byId.has(fromHash) || D.lab.bossById.has(fromHash))) open("lab", level, { startScenario: fromHash });
   else home();
 
   // Installable / offline: only when served over http(s) (service workers can't run from file://).
