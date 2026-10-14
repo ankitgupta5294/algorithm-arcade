@@ -1406,6 +1406,5 @@
       rule: "Fix noisy logging at the source; scope rate-limit exceptions to the unit that needs them, sized from its real peak rate; and make journal storage persistent (with SystemMaxUse) on every server.",
       why: (I) => I.lv === 1 ? `Debug logging produced far more than 10,000 lines per 30 s, so journald suppressed ${K.num(I.sup)}+ messages per interval, including the errors you needed. Back to info level (and a restart to apply it), the volume fits under the limit.` : I.lv === 2 ? "/var/log/journal didn't exist, so Storage=auto kept the journal in /run and the crash took it with it. Creating the directory (with tmpfiles setting its permissions) and flushing switched journald to persistent storage." : `At ${K.num(I.rate)} lines/s audit-relay needs ${K.num(I.rate * 30)} per 30 s, over the default 10,000. A per-unit drop-in with a burst of ${K.num(Math.ceil(I.rate * 30 * 1.5 / 10000) * 10000)} per 30 s fixes it while every other unit keeps the default protection.`,
     },
-    // @@more@@
   ]);
 })();

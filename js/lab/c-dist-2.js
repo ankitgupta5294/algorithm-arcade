@@ -527,4 +527,493 @@
       why: (I, sol) => { const r = partEval(I, sol); return `Key ${sol.key}, ${sol.mode === "keyed" ? "keyed executor" : sol.mode === "single" ? "one thread per partition" : "pool"}: order per ${I.scope} holds and peak utilisation is ${K.pct(r.util, 0)}.${I.lv === 3 ? ` Keying by merchant would put ${K.pct(I.topMerchant, 0)} of traffic (${K.num(I.total * I.topMerchant)} events/s) behind one consumer.` : ""}`; },
     },
   ]);
+  /* ---------- Snowflake layout (scenario 31) ---------- */
+  const YEAR_MS = 365.25 * 24 * 3600 * 1000;
+  function flakeEval(I, cfg) {
+    const seq = 63 - cfg.ts - cfg.worker, unit = cfg.unit === "10ms" ? 10 : 1;
+    const life = (2 ** cfg.ts * unit) / YEAR_MS, workers = 2 ** cfg.worker, rate = seq >= 0 ? (2 ** seq * 1000) / unit : 0;
+    const errs = [];
+    if (seq < 1) errs.push("no bits left for the sequence");
+    if (life < I.life) errs.push(`timestamps run out after ${K.num(life, 1)} years (need ${I.life})`);
+    if (workers < I.workers) errs.push(`${K.num(workers)} worker ids, fewer than the ${K.num(I.workers)} needed`);
+    if (rate < I.rate) errs.push(`only ${K.num(rate)} ids/s per worker (peak ${K.num(I.rate)})`);
+    return { seq, life, workers, rate, errs };
+  }
+
+  /* ---------- Snowflake code review (scenario 32) ---------- */
+  function flakeCode(I) {
+    const L = (t, k = " ") => ({ t, k });
+    const head = [L("@@ func (g *Generator) Next() int64 @@", "@"), L("\tg.mu.Lock()"), L("\tdefer g.mu.Unlock()"), L("\tnow := time.Now().UnixMilli() - epoch")];
+    if (I.lv === 1) return { bug: [5], file: "idgen/generator.go", lines: [...head,
+      L("\tif now == g.last {"), L("\t\tg.seq = (g.seq + 1) & seqMask", "+"), L("\t} else {"), L("\t\tg.seq = 0"), L("\t}"), L("\tg.last = now"), L(`\treturn now<<${I.tsShift} | g.worker<<${I.wShift} | g.seq`)] };
+    if (I.lv === 2) return { bug: [4], file: "idgen/generator.go", lines: [...head,
+      L("\tif now < g.last {", "+"), L(`\t\tlog.Printf("clock moved backwards by %dms, continuing", g.last-now)`, "+"), L("\t}", "+"),
+      L("\tif now == g.last {"), L("\t\tg.seq = (g.seq + 1) & seqMask"), L("\t\tif g.seq == 0 {"), L("\t\t\tfor now <= g.last { now = time.Now().UnixMilli() - epoch }"), L("\t\t}"), L("\t} else {"), L("\t\tg.seq = 0"), L("\t}"), L("\tg.last = now"), L(`\treturn now<<${I.tsShift} | g.worker<<${I.wShift} | g.seq`)] };
+    return { bug: [2], file: "idgen/main.go", lines: [L("@@ func main() @@", "@"), L("\thost := os.Getenv(\"HOSTNAME\") // pod name, e.g. ids-7d9f8c6b5-x2kqp"),
+      L(`\tworker := int64(crc32.ChecksumIEEE([]byte(host)) % ${2 ** I.wbits})`, "+"),
+      L("\tgen := idgen.New(worker)", "+"), L("\tsrv := grpcServer(gen)"), L("\tsrv.Serve(lis)"),
+      L("@@ func (g *Generator) Next() int64 @@", "@"), L("\tnow := time.Now().UnixMilli() - epoch"), L("\tif now < g.last {"), L("\t\treturn 0, ErrClockMovedBackwards // caller retries after a short sleep"), L("\t}"), L("\tif now == g.last {"), L("\t\tg.seq = (g.seq + 1) & seqMask"), L("\t\tif g.seq == 0 { now = g.waitNextMilli(g.last) }"), L("\t} else {"), L("\t\tg.seq = 0"), L("\t}")] };
+  }
+
+  /* ---------- LWW multi-region (scenario 33) ---------- */
+  function lwwModel(I) {
+    const skew = { e: 0, u: I.skew || 0 };
+    const reg = (r) => (r === "e" ? I.east : I.eu);
+    const init = { k: 0, e: { val: I.init, ts: -1e9, w: "init", seen: [] }, u: { val: I.init, ts: -1e9, w: "init", seen: [] }, writes: {}, reads: {} };
+    const tick = (s) => (s.k += 100);
+    const write = (r, id, val) => (s) => { tick(s); const cur = s[r]; const v = typeof val === "function" ? val(s, r) : val; const ts = s.k + skew[r]; s.writes[id] = { val: v, seen: [...cur.seen, cur.w].filter((x) => x !== "init") }; s[r] = { val: v, ts, w: id, seen: s.writes[id].seen }; return `${reg(r)} stores ${fmtV(v)} @ ts ${ts}`; };
+    const ship = (from, to) => (s) => { tick(s); const a = s[from], b = s[to]; if (a.w === b.w) return "already in sync"; if (a.ts > b.ts) { s[to] = { ...a, seen: [...new Set([...a.seen, ...b.seen, b.w].filter((x) => x !== "init" && x !== a.w))] }; return `${reg(to)} takes ${fmtV(a.val)} (newer ts)`; } s[to] = { ...b, seen: [...new Set([...b.seen, ...a.seen, a.w].filter((x) => x !== "init" && x !== b.w))] }; return `${reg(to)} keeps ${fmtV(b.val)} (incoming ts ${a.ts} is older)`; };
+    const fmtV = (v) => (Array.isArray(v) ? "[" + v.join(", ") + "]" : `"${v}"`);
+    const final = (s) => { const w = s.e.ts >= s.u.ts ? s.e : s.u; return w; };
+    let lanes, broken, verdict, solve, bad;
+    if (I.lv === 1) {
+      lanes = [
+        { name: `${I.east} (customer)`, steps: [`set address = "${I.a}"`], ops: [write("e", "A", I.a)] },
+        { name: `${I.eu} (support agent)`, steps: [`set address = "${I.b}"`], ops: [write("u", "B", I.b)] },
+        { name: `${I.east} → ${I.eu}`, steps: ["replicate"], ops: [ship("e", "u")] },
+        { name: `${I.eu} → ${I.east}`, steps: ["replicate"], ops: [ship("u", "e")] },
+      ];
+      broken = (s) => { const f = final(s); return ["A", "B"].some((id) => s.writes[id] && f.w !== id && !s.writes[f.w].seen.includes(id)); };
+      verdict = (s) => { const f = final(s); return `both regions converge on ${fmtV(f.val)}; ${["A", "B"].filter((id) => f.w !== id && !(s.writes[f.w] && s.writes[f.w].seen.includes(id))).map((id) => (id === "A" ? "the customer's" : "the agent's") + " write was dropped without anyone seeing it").join("") || "every overwritten write had been seen first"}`; };
+      solve = [0, 1, 2, 3]; bad = [[0, 2, 1, 3], [1, 3, 0, 2]];
+    } else if (I.lv === 2) {
+      lanes = [
+        { name: `${I.east} (customer)`, steps: [`set address = "${I.a}"`], ops: [write("e", "A", I.a)] },
+        { name: `${I.east} → ${I.eu}`, steps: ["replicate"], ops: [ship("e", "u")] },
+        { name: `${I.eu} (support agent, clock ${I.skew} ms)`, steps: ["open the ticket and read the address", `correct it to "${I.b}"`], ops: [(s) => { tick(s); s.reads.agent = s.u.val; return `agent sees ${fmtV(s.u.val)}`; }, write("u", "B", I.b)] },
+        { name: `${I.eu} → ${I.east}`, steps: ["replicate"], ops: [ship("u", "e")] },
+      ];
+      broken = (s) => { const f = final(s); return !!(s.writes.B && s.writes.B.seen.includes("A") && f.w === "A"); };
+      verdict = (s) => { const f = final(s); return `final address ${fmtV(f.val)}${s.writes.B && s.writes.B.seen.includes("A") && f.w === "A" ? ": the agent's correction, made after seeing the customer's value, lost to an older write" : ""}`; };
+      solve = [0, 1, 2, 2, 3]; bad = [[2, 2, 0, 1, 3], [0, 2, 2, 1, 3]];
+    } else {
+      const add = (item) => (s, r) => [...new Set([...s[r].val, item])].sort();
+      lanes = [
+        { name: `${I.east} (phone)`, steps: ["read cart", `write cart + ${I.a}`], ops: [(s) => { tick(s); return "reads " + fmtV(s.e.val); }, write("e", "A", add(I.a))] },
+        { name: `${I.eu} (laptop)`, steps: ["read cart", `write cart + ${I.b}`], ops: [(s) => { tick(s); return "reads " + fmtV(s.u.val); }, write("u", "B", add(I.b))] },
+        { name: `${I.east} → ${I.eu}`, steps: ["replicate"], ops: [ship("e", "u")] },
+        { name: `${I.eu} → ${I.east}`, steps: ["replicate"], ops: [ship("u", "e")] },
+      ];
+      broken = (s) => { const f = final(s); return !(f.val.includes(I.a) && f.val.includes(I.b)); };
+      verdict = (s) => { const f = final(s); return `both regions converge on ${fmtV(f.val)}${broken(s) ? ": an added item vanished" : ""}`; };
+      solve = [0, 0, 1, 1, 2, 3]; bad = [[0, 0, 2, 1, 1, 3], [1, 1, 3, 0, 0, 2]];
+    }
+    return { init: I.lv === 3 ? { ...init, e: { ...init.e, val: [I.init] }, u: { ...init.u, val: [I.init] } } : init, lanes, broken, verdict, solve, bad };
+  }
+
+  /* ---------- hedged requests (scenario 34) ---------- */
+  const hedgeCache = new Map();
+  function hedgeSamples(I) {
+    const key = I.seed;
+    if (hedgeCache.has(key)) return hedgeCache.get(key);
+    const R = rng(I.seed), N = I.fan > 1 ? 3000 : 20000, M = N * I.fan;
+    const heavy = [], a = [], b = [];
+    for (let i = 0; i < M; i++) {
+      const hv = I.heavy && R.next() < I.heavy ? I.heavyMs : 0;
+      const one = () => K.logn(R, I.med, 0.35) + (R.next() < I.q ? K.exp(R, I.hic) : 0) + hv;
+      heavy.push(hv); a.push(one()); b.push(one());
+    }
+    const single = a.slice().sort((x, y) => x - y);
+    const pct = (p) => single[Math.min(single.length - 1, Math.floor(p * single.length))];
+    const out = { N, a, b, pct };
+    hedgeCache.set(key, out);
+    return out;
+  }
+  function hedgeEval(I, cfg) {
+    const S = hedgeSamples(I);
+    const d = cfg.at === "off" ? Infinity : S.pct(+cfg.at / 100);
+    const lat = [];
+    let hedges = 0, extra = 0;
+    for (let r = 0; r < S.N; r++) {
+      let mx = 0;
+      for (let j = 0; j < I.fan; j++) {
+        const i = r * I.fan + j, x = S.a[i];
+        let l = x;
+        if (x > d) { hedges++; const y = d + S.b[i]; l = Math.min(x, y); extra += cfg.cancel === "yes" ? (l - d) / S.b[i] : 1; }
+        if (l > mx) mx = l;
+      }
+      lat.push(mx);
+    }
+    const p99 = K.quantile(lat, 0.99), load = extra / (S.N * I.fan);
+    return { p99, load, hedges, d, errs: load > I.budget ? [`hedges add ${K.pct(load, 1)} load (budget ${K.pct(I.budget, 0)})`] : [] };
+  }
+
+  /* ---------- gossip (scenario 35) ---------- */
+  function gossipRounds(I) {
+    const R = rng(I.seed), runs = 12, res = [];
+    for (let k = 0; k < runs; k++) {
+      const inf = new Uint8Array(I.n); inf[0] = 1; let cnt = 1, rounds = 0;
+      while (cnt < I.n && rounds < 200) {
+        rounds++;
+        const add = [];
+        for (let i = 0; i < I.n; i++) {
+          if (inf[i]) { for (let f = 0; f < I.f; f++) { if (I.loss && R.next() < I.loss) continue; add.push(Math.floor(R.next() * I.n)); } }
+          else if (I.pull) { for (let f = 0; f < I.f; f++) { const j = Math.floor(R.next() * I.n); if (inf[j] && !(I.loss && R.next() < I.loss)) { add.push(i); break; } } }
+        }
+        add.forEach((j) => { if (!inf[j]) { inf[j] = 1; cnt++; } });
+      }
+      res.push(rounds);
+    }
+    return K.mean(res);
+  }
+
+  /* ---------- quorum availability topology (scenario 37) ---------- */
+  function quorumTopo(I, a) {
+    const down = new Set(a.down || []), cut = new Set(a.cut || []);
+    const adj = I.nodes.map(() => []);
+    I.links.forEach(([x, y], i) => { if (cut.has(i) || down.has(x) || down.has(y)) return; adj[x].push(y); adj[y].push(x); });
+    const comp = I.nodes.map(() => -1); let c = 0;
+    I.nodes.forEach((_, s) => { if (comp[s] >= 0 || down.has(s)) return; const st = [s]; comp[s] = c; while (st.length) { const u = st.pop(); adj[u].forEach((v) => { if (comp[v] < 0) { comp[v] = c; st.push(v); } }); } c++; });
+    const voters = I.nodes.map((n, i) => (n.voter ? i : -1)).filter((i) => i >= 0);
+    const n = voters.length, need = maj(n);
+    const sizes = {};
+    voters.forEach((v) => { if (!down.has(v)) sizes[comp[v]] = (sizes[comp[v]] || 0) + 1; });
+    const best = Math.max(0, ...Object.values(sizes));
+    return { best, need, ok: best >= need, groups: Object.values(sizes).sort((x, y) => y - x) };
+  }
+
+  /* ---------- split brain (scenario 38) ---------- */
+  function splitBrain(I, cut) {
+    const cs = new Set(cut || []);
+    const link = (a, b) => I.links.findIndex(([x, y]) => (x === a && y === b) || (x === b && y === a));
+    const up = (a, b) => { const i = link(a, b); return i >= 0 && !cs.has(i); };
+    const P = 0, S = 1, W = I.witness ? 2 : -1, apps = I.apps;
+    const sPromotes = !up(S, P) && (W < 0 || (up(S, W) && !up(W, P)));
+    const pStays = I.lv < 3 ? true : up(P, S) || (W >= 0 && up(P, W)) || apps.some((x) => up(P, x));
+    const pWrites = pStays && apps.some((x) => up(x, P));
+    const sWrites = sPromotes && apps.some((x) => up(x, S));
+    return { sPromotes, pStays, pWrites, sWrites, split: pWrites && sWrites };
+  }
+
+  /* ---------- etcd shell (scenario 39) ---------- */
+  function etcdShell(I) {
+    const hex = (k) => I.ids[k];
+    const members = I.names.map((n, k) => ({ id: hex(k), name: n, ip: I.ips[k], up: !(I.lv === 1 && k === I.dead) && !(I.lv === 3 && k !== I.alive), started: true }));
+    const quorum = (st) => st.members.filter((m) => m.up && m.started).length >= maj(st.members.length);
+    const sh = K.shell([
+      { re: /^etcdctl member list(?: -w table| --write-out=table)?$/, use: "etcdctl member list -w table", desc: "cluster membership", run: (m, st) => {
+        if (!quorum(st)) return "{\"level\":\"warn\",\"msg\":\"retrying of unary invoker failed\",\"error\":\"rpc error: code = DeadlineExceeded desc = context deadline exceeded\"}\nError: context deadline exceeded";
+        return K.cols([["ID", "STATUS", "NAME", "PEER ADDRS", "CLIENT ADDRS", "IS LEARNER"], ...st.members.map((x) => [x.id, x.started ? "started" : "unstarted", x.started ? x.name : "", `https://${x.ip}:2380`, x.started ? `https://${x.ip}:2379` : "", "false"])]);
+      } },
+      { re: /^etcdctl endpoint health(?: --cluster)?$/, use: "etcdctl endpoint health", desc: "health of each endpoint", run: (m, st) => st.members.map((x) => (x.up && x.started && quorum(st) ? `https://${x.ip}:2379 is healthy: successfully committed proposal: took = ${(1.6 + (x.ip.length % 5) / 3).toFixed(6)}ms` : `https://${x.ip}:2379 is unhealthy: failed to commit proposal: context deadline exceeded`)).join("\n") + (st.members.some((x) => !(x.up && x.started && quorum(st))) ? "\nError: unhealthy cluster" : "") },
+      { re: /^etcdctl endpoint status(?: --cluster)?(?: -w (table|json)| --write-out=(table|json))?$/, use: "etcdctl endpoint status -w table|json", desc: "db size, leader, raft term, revision", run: (m, st) => {
+        const live = st.members.filter((x) => x.up && x.started);
+        if ((m[1] || m[2]) === "json") return JSON.stringify(live.map((x) => ({ Endpoint: `https://${x.ip}:2379`, Status: { header: { member_id: x.id, revision: st.rev, raft_term: I.term }, version: "3.5.16", dbSize: Math.round(st.db * 1024 ** 3), dbSizeInUse: Math.round(st.inuse * 1024 ** 3), leader: live[0].id, raftIndex: I.idx, raftTerm: I.term, errors: st.alarm ? ["memberID:" + x.id + " alarm:NOSPACE "] : [] } })));
+        return K.cols([["ENDPOINT", "ID", "VERSION", "DB SIZE", "IS LEADER", "IS LEARNER", "RAFT TERM", "RAFT INDEX", "ERRORS"], ...live.map((x, k) => [`https://${x.ip}:2379`, x.id, "3.5.16", `${K.num(st.db, 1)} GB`, quorum(st) && k === 0 ? "true" : "false", "false", String(I.term), String(I.idx), st.alarm ? "memberID:" + x.id + " alarm:NOSPACE" : ""])]) + (st.members.length > live.length ? `\n{"level":"warn","msg":"failed to get the status of endpoint","endpoint":"https://${st.members.find((x) => !x.up).ip}:2379","error":"context deadline exceeded"}` : "");
+      } },
+      { re: /^etcdctl alarm list$/, use: "etcdctl alarm list", desc: "", run: (m, st) => (st.alarm ? st.members.map((x) => `memberID:${parseInt(x.id.slice(0, 8), 16)} alarm:NOSPACE`).join("\n") : "") },
+      { re: /^etcdctl alarm disarm$/, use: "etcdctl alarm disarm", desc: "clear alarms", run: (m, st) => { if (!st.alarm) return ""; if (st.db > I.quota) { return { out: "memberID:… alarm:NOSPACE\n(the database is still over its quota; the alarm is raised again on the next write)" }; } st.alarm = false; return st.members.map((x) => `memberID:${parseInt(x.id.slice(0, 8), 16)} alarm:NOSPACE`).join("\n"); } },
+      { re: /^etcdctl compact (\d+)(?: --physical)?$/, use: "etcdctl compact <revision>", desc: "drop history older than a revision", run: (m, st) => { const r = +m[1]; if (r > st.rev) return `Error: etcdserver: mvcc: required revision is a future revision`; if (r <= st.compacted) return "Error: etcdserver: mvcc: required revision has been compacted"; st.compacted = r; st.inuse = I.live + (st.rev - r) * 0.00002; return `compacted revision ${r}`; } },
+      { re: /^etcdctl defrag(?: --cluster)?$/, use: "etcdctl defrag --cluster", desc: "release free pages to the filesystem", run: (m, st) => { st.db = Math.min(st.db, st.inuse); return st.members.filter((x) => x.up).map((x) => `Finished defragmenting etcd member[https://${x.ip}:2379]`).join("\n"); } },
+      { re: /^etcdctl del --prefix (\S+)$/, use: "etcdctl del --prefix <key>", desc: "delete keys", run: (m, st) => { if (st.alarm) return { out: "Error: etcdserver: mvcc: database space exceeded", danger: "Deleting live data is the wrong lever: deletes write new revisions, and space only returns after compaction and defrag." }; return { out: "48211", danger: "You deleted live data from the cluster." }; } },
+      { re: /^etcdctl member remove ([0-9a-f]+)$/, use: "etcdctl member remove <id>", desc: "remove a member", run: (m, st) => {
+        if (!quorum(st)) return "Error: context deadline exceeded";
+        const x = st.members.find((y) => y.id === m[1]); if (!x) return `Error: etcdserver: member not found`;
+        st.members = st.members.filter((y) => y !== x);
+        return { out: `Member ${x.id} removed from cluster ${I.cluster}`, danger: x.up ? `${x.name} was healthy: you just reduced the cluster's fault tolerance.` : null };
+      } },
+      { re: /^etcdctl member add (\S+) --peer-urls=https:\/\/([\d.]+):2380$/, use: "etcdctl member add <name> --peer-urls=https://<ip>:2380", desc: "add a member (start it afterwards)", run: (m, st) => {
+        if (!quorum(st)) return "Error: context deadline exceeded";
+        const deadIn = st.members.some((x) => !x.up);
+        st.members.push({ id: I.newId, name: m[1], ip: m[2], up: true, started: false });
+        return { out: `Member ${I.newId} added to cluster ${I.cluster}\n\nETCD_NAME="${m[1]}"\nETCD_INITIAL_CLUSTER="${st.members.map((x) => `${x.name}=https://${x.ip}:2380`).join(",")}"\nETCD_INITIAL_ADVERTISE_PEER_URLS="https://${m[2]}:2380"\nETCD_INITIAL_CLUSTER_STATE="existing"`, danger: deadIn ? `With the dead member still listed the cluster now has ${st.members.length} members and needs ${maj(st.members.length)} for quorum, while only ${st.members.filter((x) => x.up && x.started).length} are running. Remove the dead member first.` : null };
+      } },
+      { re: /^ssh (\S+) sudo systemctl (start|restart|stop) etcd$/, use: "ssh <host> sudo systemctl start|stop etcd", desc: "", run: (m, st) => {
+        const x = st.members.find((y) => y.name === m[1] || y.ip === m[1]);
+        if (!x) return `ssh: Could not resolve hostname ${m[1]}`;
+        if (m[2] === "stop") { x.started = false; return quorum(st) || I.lv === 3 ? "" : { out: "", danger: "Stopping that member cost the cluster its quorum." }; }
+        if (!x.up && I.lv !== 3) return `ssh: connect to host ${x.ip} port 22: No route to host`;
+        if (I.lv === 3 && x.name !== I.names[I.alive]) return `ssh: connect to host ${x.ip} port 22: No route to host`;
+        x.started = true;
+        if (I.lv === 3 && st.flag && !st.forced) { if (!st.snap) return { out: "", danger: "You forced a new cluster without a fresh snapshot to fall back on." }; st.forced = true; st.members = st.members.filter((y) => y === x); }
+        if (I.lv === 3 && st.forced && st.flag && st.restartsWithFlag++ > 0) return { out: "", danger: "Restarting with ETCD_FORCE_NEW_CLUSTER still set rewrites membership again on every start; remove it once the cluster is up." };
+        return "";
+      } },
+      { re: /^etcdctl snapshot save (\S+)$/, use: "etcdctl snapshot save <file>", desc: "save a backup from the endpoint", run: (m, st) => { st.snap = true; return `{"level":"info","msg":"fetched snapshot","endpoint":"https://${I.ips[I.alive != null ? I.alive : 0]}:2379","size":"${K.num(I.live || 1.2, 1)} GB"}\nSnapshot saved at ${m[1]}`; } },
+      { re: /^ssh (\S+) "?echo ETCD_FORCE_NEW_CLUSTER=true \| sudo tee -a \/etc\/etcd\/etcd\.env"?$/, use: `ssh <host> "echo ETCD_FORCE_NEW_CLUSTER=true | sudo tee -a /etc/etcd/etcd.env"`, desc: "set --force-new-cluster for the next start", run: (m, st) => { st.flag = true; return "ETCD_FORCE_NEW_CLUSTER=true"; } },
+      { re: /^ssh (\S+) "?sudo sed -i '\/ETCD_FORCE_NEW_CLUSTER\/d' \/etc\/etcd\/etcd\.env"?$/, use: `ssh <host> "sudo sed -i '/ETCD_FORCE_NEW_CLUSTER/d' /etc/etcd/etcd.env"`, desc: "remove the flag again", run: (m, st) => { st.flag = false; return ""; } },
+      { re: /^ssh (\S+) sudo rm -rf \/var\/lib\/etcd\S*$/, use: "ssh <host> sudo rm -rf /var/lib/etcd", desc: "", hidden: true, run: (m, st) => { st.wiped = true; return { out: "", danger: "You deleted the only surviving copy of the data." }; } },
+    ], { sh: "bash" });
+    return {
+      prompt: "ops@bastion:~$", run: (line, st) => sh.run(line, st), par: I.lv === 3 ? 8 : 6,
+      init: { members, rev: I.rev, compacted: I.rev - 2000000, db: I.lv === 2 ? I.quota + 0.01 : 1.1, inuse: I.lv === 2 ? I.quota + 0.01 : 1.1, alarm: I.lv === 2, snap: false, flag: false, forced: false, restartsWithFlag: 0, wiped: false },
+      motd: I.lv === 1 ? `ALERT etcd member ${I.names[I.dead]} (${I.ips[I.dead]}) unreachable for 2h: disk failed, host replaced by ${I.newName} (${I.newIp}).\nETCDCTL_ENDPOINTS set to all members.` : I.lv === 2 ? "ALERT kube-apiserver: etcdserver: mvcc: database space exceeded. Writes failing cluster-wide.\nETCDCTL_ENDPOINTS set to all members." : `ALERT etcd: ${I.names.filter((_, k) => k !== I.alive).join(" and ")} lost with their disks (AZ incident). Only ${I.names[I.alive]} (${I.ips[I.alive]}) survives.\nETCDCTL_ENDPOINTS=https://${I.ips[I.alive]}:2379`,
+      cmds: I.lv === 1 ? ["etcdctl member list -w table", "etcdctl endpoint health", "etcdctl member remove <id>", `etcdctl member add ${I.newName} --peer-urls=https://${I.newIp}:2380`, `ssh ${I.newName} sudo systemctl start etcd`]
+        : I.lv === 2 ? ["etcdctl endpoint status -w table", "etcdctl alarm list", "etcdctl endpoint status -w json", "etcdctl compact <revision>", "etcdctl defrag --cluster", "etcdctl alarm disarm"]
+          : ["etcdctl member list -w table", "etcdctl endpoint status -w table", "etcdctl snapshot save /backup/etcd-pre-recovery.db", `ssh ${I.names[I.alive]} sudo systemctl stop etcd`, `ssh ${I.names[I.alive]} "echo ETCD_FORCE_NEW_CLUSTER=true | sudo tee -a /etc/etcd/etcd.env"`, `ssh ${I.names[I.alive]} sudo systemctl start etcd`, `ssh ${I.names[I.alive]} "sudo sed -i '/ETCD_FORCE_NEW_CLUSTER/d' /etc/etcd/etcd.env"`],
+    };
+  }
+
+  LB.addAll("dist", [
+    /* 31 */ {
+      id: "dist-snowflake-layout",
+      name: "Lay out the 64-bit ID",
+      kind: "Design review",
+      skills: ["design", "estimate"],
+      w: "tune",
+      vname: "a lifetime of",
+      gen(lv, R) {
+        return { lv, life: lv === 1 ? 40 : lv === 2 ? 100 : 60, workers: lv === 1 ? R.pick([200, 500]) : lv === 2 ? R.pick([1000, 3000]) : R.pick([20000, 30000]), rate: lv === 1 ? R.pick([20000, 50000]) : lv === 2 ? R.pick([200000, 400000]) : R.pick([40000, 60000]), svc: R.pick(["order ids", "event ids", "message ids"]) };
+      },
+      text: (I) => `<p>You're designing Snowflake-style ${esc(I.svc)}: a 64-bit signed integer = 1 sign bit (0) + timestamp since a custom epoch + worker id + per-worker sequence. Requirements: ids last <b>${I.life} years</b> from the epoch, support <b>${K.num(I.workers)} concurrent worker ids</b>${I.lv === 3 ? " (Kubernetes pods lease an id at start; ids are not reused until the lease expires, so churn multiplies the count)" : ""}, and <b>${K.num(I.rate)} ids/s per worker</b> at peak. Maximise lifetime.</p>`,
+      ui: (I) => ({ knobs: [
+        { k: "ts", label: "Timestamp bits", min: 36, max: 42, step: 1 },
+        { k: "worker", label: "Worker-id bits", min: 5, max: 16, step: 1 },
+        { k: "unit", label: "Timestamp unit", opts: ["1ms", "10ms"] },
+      ], init: { ts: 41, worker: 10 }, live: (cfg) => { const r = flakeEval(I, cfg); return K.metrics([
+        { name: "Sequence bits", value: String(r.seq), ok: r.seq >= 1 },
+        { name: "Lifetime", value: `${K.num(r.life, 1)} years`, ok: r.life >= I.life, target: `≥ ${I.life}` },
+        { name: "Worker ids", value: K.num(r.workers), ok: r.workers >= I.workers, target: `≥ ${K.num(I.workers)}` },
+        { name: "Ids/s per worker", value: K.num(r.rate), ok: r.rate >= I.rate, target: `≥ ${K.num(I.rate)}` },
+      ]); } }),
+      valid: (I, cfg) => { const r = flakeEval(I, cfg); return r.errs.length ? r.errs[0] : true; },
+      val: (I, cfg) => Math.round(flakeEval(I, cfg).life * 10),
+      vfmt: (v) => `${K.num(v / 10, 1)} years`,
+      hint: (I) => I.lv === 1 ? "41 bits of milliseconds is about 69.7 years. Each bit doubles it." : I.lv === 2 ? "A coarser timestamp unit trades lifetime against sequence space per tick." : "Worker bits come first: 2^bits must cover every id that can be leased at once.",
+      concept: "Snowflake ID bit budgets",
+      how: "A Snowflake id packs a timestamp, a worker id and a sequence into 63 usable bits, so every bit you give one field halves another's range. Timestamp bits × unit set the lifetime from the custom epoch (41 bits of ms ≈ 69.7 years). Worker bits cap how many generators can run at once without coordination, including ids held by recently dead pods. Sequence bits cap ids per tick per worker; when they run out, the generator must wait for the next tick. Ids sort roughly by time, which keeps B-tree inserts append-mostly.",
+      rule: "Size worker bits from peak concurrent generators (with churn), sequence bits from peak rate per tick, and give the rest to the timestamp; check the lifetime against the epoch you pick.",
+      why: (I, sol) => { const r = flakeEval(I, sol); return `${sol.ts} timestamp bits at ${sol.unit}, ${sol.worker} worker bits, ${r.seq} sequence bits: ${K.num(r.life, 1)} years, ${K.num(r.workers)} workers, ${K.num(r.rate)} ids/s each.`; },
+    },
+    /* 32 */ {
+      id: "dist-snowflake-review",
+      name: "Review the ID generator",
+      kind: "Code review",
+      skills: ["diagnose"],
+      w: "lines",
+      gen(lv, R) { const wbits = R.pick([10, 12]); return { lv, wbits, wShift: 12, tsShift: 12 + wbits }; },
+      text: (I) => I.lv === 1 ? `<p>A teammate wrote this Snowflake generator. During a load test at 2M ids/s on one worker, the database reported duplicate primary keys. Flag the line responsible.</p>`
+        : I.lv === 2 ? `<p>The generator now waits for the next millisecond when the sequence wraps. After a VM live-migration, chrony stepped the clock back 300 ms and duplicate ids appeared again. Flag the line responsible.</p>`
+          : `<p>The service now refuses to issue ids while the clock is behind. It runs as a Deployment of 300 pods with ${I.wbits}-bit worker ids, and duplicates still appear about once a week. Flag the line responsible.</p>`,
+      ui: (I) => { const c = flakeCode(I); return { lines: c.lines, file: c.file, k: 1 }; },
+      ans: (I) => flakeCode(I).bug,
+      diag: (I) => I.lv === 1 ? "Not that one. What happens on the 4097th id within the same millisecond?" : I.lv === 2 ? "Not that one. What does the code do after noticing the clock went backwards?" : "Not that one. How likely is it that two of 300 pods get the same worker id?",
+      hint: (I) => I.lv === 1 ? "When the sequence wraps to 0 in the same millisecond, the next id equals the first one of that millisecond." : I.lv === 2 ? "Logging isn't handling." : "Birthday problem: 300 values hashed into a small space.",
+      concept: "Snowflake failure modes",
+      how: "A Snowflake generator is unique only if three things hold: the sequence never wraps within one tick (on overflow it must wait for the next tick), the timestamp never goes backwards for a given worker (on a backwards step it must wait or refuse, never reuse old timestamps), and no two live generators share a worker id. Wall clocks do step backwards (NTP/chrony corrections, VM migration, leap-second smearing differences). Worker ids derived by hashing hostnames collide by the birthday paradox: 300 pods in 1,024 ids collide with near certainty. Lease worker ids from a coordinator (etcd/ZooKeeper/a database row) instead.",
+      rule: "Wait on sequence overflow, refuse or wait on clock regression, and assign worker ids by lease, not by hash.",
+      why: (I) => I.lv === 1 ? "At 2M ids/s a millisecond needs more than 4,096 ids; the sequence wraps to 0 and repeats ids already issued in that millisecond." : I.lv === 2 ? "When the clock stepped back 300 ms, the generator kept going and reissued timestamps (and sequences) it had already used." : `With 300 pods hashed into ${K.num(2 ** I.wbits)} worker ids, the chance that some pair collides is ${K.pct(1 - Math.exp((-300 * 299) / (2 * 2 ** I.wbits)), 0)}; colliding pods issue identical ids whenever they hit the same millisecond and sequence.`,
+    },
+    /* 33 */ {
+      id: "dist-lww-data-loss",
+      name: "Lose a write to last-writer-wins",
+      kind: "Experiment",
+      skills: ["diagnose", "design"],
+      gen(lv, R) {
+        const [east, eu] = R.pick([["us-east-1", "eu-west-1"], ["us-west-2", "eu-central-1"], ["us-east-2", "ap-south-1"]]);
+        if (lv === 3) return { lv, east, eu, init: R.pick(["coffee", "tea"]), a: R.pick(["mug", "filter"]), b: R.pick(["grinder", "kettle"]), skew: 0 };
+        return { lv, east, eu, init: "12 Old St", a: R.pick(["4 Elm Rd", "9 Oak Ave", "77 Pine Ln"]), b: R.pick(["4 Elm Road, Apt 2", "9 Oak Avenue #3", "77 Pine Lane, Unit 5"]), skew: lv === 2 ? -R.pick([300, 450, 600]) : 0 };
+      },
+      ...laneScenario(lwwModel),
+      text: (I) => I.lv === 1 ? `<p>Customer profiles are active-active in ${esc(I.east)} and ${esc(I.eu)}, replicated asynchronously; conflicts resolve by <b>last writer wins</b> on a write timestamp. Steps happen 100 ms apart. Build a schedule where a write is <b>silently discarded</b> without the other writer ever having seen it.</p>`
+        : I.lv === 2 ? `<p>Same setup, but ${esc(I.eu)}'s clock runs <b>${-I.skew} ms behind</b>. A support agent fixes the customer's address after reading it. Build a schedule where the agent's correction, made <b>after</b> seeing the customer's value, loses to it.</p>`
+          : `<p>Shopping carts are stored as one document per user, active-active with last-writer-wins, clocks in sync. The same user adds items on two devices routed to different regions. Build a schedule where, after replication settles, <b>an added item is gone</b>.</p>`,
+      hint: (I) => I.lv === 1 ? "Two writes that happen before either region hears about the other are concurrent; LWW picks one." : I.lv === 2 ? "Timestamps from a slow clock look older even when the write happened later." : "Each device writes back the whole cart it read.",
+      concept: "Last-writer-wins loses data",
+      how: "Active-active replication must resolve concurrent writes somehow; last-writer-wins keeps the version with the highest timestamp and discards the other, without telling anyone. That's fine only when losing a concurrent write is acceptable. Wall-clock skew makes it worse: a write that causally follows another (its author saw the earlier value) can still lose if its region's clock is behind. Whole-document LWW on collections (carts, sets) drops additions made concurrently. Alternatives: per-field merges, CRDTs (OR-Set for a cart), version vectors with siblings, or routing each record's writes to a single home region.",
+      rule: "Use LWW only for data where dropping a concurrent update is acceptable; for collections use CRDTs, and for causally ordered edits use version vectors or a single writer region.",
+      why: (I) => I.lv === 1 ? "Both writes were made before replication crossed; LWW kept the one with the higher timestamp and dropped the other with no conflict surfaced." : I.lv === 2 ? `The agent wrote after seeing the customer's value, but ${esc(I.eu)}'s clock is ${-I.skew} ms behind, so its timestamp was lower and LWW threw the correction away.` : "Each device read the cart before the other's write replicated and wrote back its own full copy; LWW kept one document and the other item vanished. An OR-Set merges both adds.",
+    },
+    /* 34 */ {
+      id: "dist-hedged-requests",
+      name: "Hedge the tail",
+      kind: "Experiment",
+      skills: ["tune", "estimate"],
+      w: "tune",
+      sense: "min",
+      vname: "p99 of",
+      gen(lv, R) {
+        return { lv, seed: `hedge/${lv}/${R.int(1, 1e9)}`, fan: lv === 1 ? 1 : R.pick([20, 40]), med: R.pick([8, 10, 12]), q: R.pick([0.02, 0.03]), hic: R.pick([150, 200]), heavy: lv === 3 ? 0.012 : 0, heavyMs: 400, budget: 0.05, svc: R.pick(["search leaves", "the feature store", "the KV cache tier"]) };
+      },
+      text: (I) => `<p>Calls to ${esc(I.svc)} take ~${I.med} ms, but ${K.pct(I.q, 0)} hit a replica-side hiccup (GC, compaction) adding ~${I.hic} ms.${I.lv === 3 ? ` About ${K.pct(I.heavy, 1)} of requests are inherently expensive (huge keys) and take ~${I.heavyMs} ms on any replica.` : ""} ${I.fan > 1 ? `Each user request fans out to <b>${I.fan}</b> of them and waits for all.` : ""}</p><p>A hedged request sends a second copy to another replica if the first hasn't answered after a delay. Minimise the user-facing p99 while hedging adds at most <b>${K.pct(I.budget, 0)}</b> extra load. (Simulated on recorded latency samples.)</p>`,
+      ui: (I) => ({ knobs: [
+        { k: "at", label: "Hedge after the single-call", opts: ["off", "50", "90", "95", "98", "99"], fmt: (v) => (v === "off" ? "never" : "p" + v) },
+        { k: "cancel", label: "Cancel the slower copy when one answers", opts: ["no", "yes"] },
+      ], liveDelay: 200, live: (cfg) => { const r = hedgeEval(I, cfg), base = hedgeEval(I, { at: "off", cancel: "no" }); return K.metrics([
+        { name: "Hedge delay", value: Number.isFinite(r.d) ? K.ms(r.d) : "–", ok: null },
+        { name: "User p99", value: K.ms(r.p99), ok: null, target: `unhedged ${K.ms(base.p99)}` },
+        { name: "Extra load", value: K.pct(r.load, 1), ok: r.load <= I.budget, target: `≤ ${K.pct(I.budget, 0)}` },
+      ]); } }),
+      valid: (I, cfg) => { const r = hedgeEval(I, cfg); return r.errs.length ? r.errs[0] : true; },
+      val: (I, cfg) => Math.round(hedgeEval(I, cfg).p99 * 10),
+      vfmt: (v) => K.ms(v / 10),
+      hint: (I) => I.lv === 1 ? "Hedging after the p95 sends a second copy for about 5% of calls." : I.lv === 2 ? `With ${I.fan} calls per request, the user's p99 is set by roughly the p99.9+ of a single call.` : "A hedge to another replica can't help a request that is slow everywhere; cancelling losers recovers some budget.",
+      concept: "Hedged requests and tail at scale",
+      how: "When a request fans out to N servers and waits for all, its latency is the maximum of N samples, so rare per-server slowness becomes common: with 1% slow calls and 40 leaves, a third of user requests hit one. Hedging sends a backup request after a delay (typically the p90–p99 of normal latency) and takes whichever answers first, cutting tails caused by transient, server-specific hiccups for a few percent extra load. Cancelling the loser reduces the cost. Hedging does nothing for requests that are inherently slow everywhere, and it adds load, so it must be budgeted.",
+      rule: "Hedge at a high percentile (p95-ish), cancel the loser, cap the extra load, and fix inherently slow requests separately.",
+      why: (I, sol) => { const r = hedgeEval(I, sol), b = hedgeEval(I, { at: "off", cancel: "no" }); return `Hedging at ${sol.at === "off" ? "never" : "p" + sol.at}${sol.cancel === "yes" ? " with cancellation" : ""}: p99 ${K.ms(b.p99)} → ${K.ms(r.p99)} for ${K.pct(r.load, 1)} extra load.`; },
+    },
+    /* 35 */ {
+      id: "dist-gossip-rounds",
+      name: "How long until everyone knows?",
+      kind: "Estimate",
+      skills: ["estimate"],
+      w: "num",
+      gen(lv, R) { const I = { lv, seed: `gossip/${lv}/${R.int(1, 1e9)}`, n: lv === 1 ? R.pick([500, 1000, 2000]) : lv === 2 ? R.pick([2000, 5000]) : R.pick([4000, 8000]), f: lv === 1 ? 1 : lv === 2 ? 3 : 1, pull: lv === 3, loss: lv === 3 ? 0.2 : 0 }; I.truth = K.round(gossipRounds(I), 1); return I; },
+      text: (I) => `<p>A membership change starts at one node of a <b>${K.num(I.n)}-node</b> cluster and spreads by gossip. Every round, each node that knows it ${I.pull ? "pushes it to 1 random peer, and each node that doesn't know it pulls from 1 random peer" : `sends it to <b>${I.f}</b> random peer${I.f > 1 ? "s" : ""}`}${I.loss ? `; <b>${K.pct(I.loss, 0)}</b> of messages are lost` : ""}. About how many rounds until <b>every</b> node knows?</p>`,
+      ui: () => ({ unit: "rounds" }),
+      accept: LB.near((I) => I.truth, 0.25),
+      solve: (I) => I.truth,
+      bad: (I) => [Math.round(Math.log2(I.n) / 3), I.n / 10].filter((x) => Math.abs(x - I.truth) > I.truth * 0.25),
+      hint: (I) => I.pull ? "Push spreads fast early; pull finishes fast late (each uninformed node finds an informed one with high probability once most know). Loss slows both a little." : "Push gossip: about log_(1+f) N rounds to reach most nodes, plus about ln N / f more to reach the last stragglers.",
+      concept: "Epidemic (gossip) dissemination",
+      how: "In push gossip each informed node contacts f random peers per round. Early on the informed set grows by a factor of about (1 + f) per round, so reaching most nodes takes about log_(1+f) N rounds; the last few uninformed nodes are found only by chance, which adds about ln N / f rounds. Push-pull also lets uninformed nodes ask, which finishes the tail quickly (the uninformed fraction squares each round), so total time is around log₂ N + ln ln N. Message loss slows spreading proportionally but rarely stops it, which is why gossip is used for membership, failure detection and anti-entropy (SWIM, Cassandra, Consul/Serf).",
+      rule: "Gossip convergence grows with log N: budget a few dozen rounds for thousands of nodes, and use push-pull or anti-entropy to catch the stragglers.",
+      why: (I) => `Simulating it gives about ${K.num(I.truth, 1)} rounds. log2(${K.num(I.n)}) ≈ ${K.num(Math.log2(I.n), 1)}${I.pull ? "; pull finishes the tail in a couple of rounds" : `, and the straggler tail adds about ln N / f ≈ ${K.num(Math.log(I.n) / I.f, 1)}`}.`,
+    },
+    /* 36 */ {
+      id: "dist-cap-choices",
+      name: "Consistency or availability?",
+      kind: "Decision",
+      skills: ["design", "comms"],
+      w: "classify",
+      gen(lv, R) {
+        const bank = {
+          1: [["Claiming a unique username at sign-up", 0], ["Showing the like count on a post", 1], ["Moving money between two customer accounts", 0], ["Showing a user's recently viewed items", 1], ["Issuing a lock that guarantees one leader runs the nightly billing job", 0], ["Adding an item to a shopping cart", 1], ["Rendering the product catalog page", 1], ["Assigning the last seat on a flight", 0]],
+          2: [["Selling 50,000 concert tickets from 3 regions, each region given a quota it can sell offline", 2], ["Rate limiting API calls to ~1,000/min per tenant across 4 regions (a few % over is fine)", 2], ["Changing a password so the old one stops working everywhere", 0], ["Posting a comment", 1], ["Debiting a prepaid balance that must never go negative", 0], ["Spending from a per-region slice of a marketing budget", 2], ["Updating a user's avatar", 1], ["Reserving a unique invoice number for a legal document", 0]],
+          3: [["Revoking a compromised API key", 0], ["Shopping cart quantities during a region partition", 1], ["Selling limited-edition sneakers (500 pairs) across regions during a partition", 2], ["Showing a delivery ETA computed from the courier's last GPS ping", 1], ["Committing a schema migration to the shared config store", 0], ["Charging a card for an order when the payment service in one region is cut off", 0], ["Allowing up to 3 concurrent streams per subscription across regions", 2], ["Personalised recommendations", 1]],
+        };
+        const cats = lv === 1 ? ["Refuse during a partition (CP)", "Keep serving, reconcile later (AP)"] : ["Refuse during a partition (CP)", "Keep serving, reconcile later (AP)", "Keep serving within pre-allocated limits (escrow / bounded)"];
+        return { lv, cats, items: R.sample(bank[lv], 6) };
+      },
+      text: (I) => `<p>Your platform runs in several regions. When the network partitions a region from the others, each feature must either <b>refuse</b> operations it can't do safely, or <b>keep serving</b> and reconcile afterwards${I.lv > 1 ? ", or keep serving only within limits allocated to each region in advance" : ""}. For each feature, choose what the product actually needs.</p>`,
+      ui: (I) => ({ items: I.items.map((x) => x[0]), cats: I.cats }),
+      ans: (I) => I.items.map((x) => x[1]),
+      diag: () => "Not quite. Ask what goes wrong if two partitioned regions both accept the operation, and whether you can repair it afterwards (merge, apologise, refund) or not.",
+      hint: (I) => I.lv === 1 ? "If two sides both say yes, can you fix it later? Two users with the same username can't both keep it." : "Escrow fits invariants on quantities (stock, budgets, quotas) where each region can safely spend its own share without asking.",
+      concept: "CAP choices per feature",
+      how: "During a partition a replicated system must either reject some operations (stay consistent) or accept them on both sides (stay available) and reconcile later. The choice is per operation, not per database: uniqueness, money movement and security revocations break if both sides say yes, while likes, carts and caches can merge afterwards. For quantity invariants there's a middle path: split the total into per-region allowances (escrow) so each side can keep serving within its share without coordination. PACELC adds that even without partitions, strong consistency costs latency.",
+      rule: "Decide per operation: if two sides saying yes is irreparable, coordinate (and accept unavailability); if it can be merged or apologised for, stay available; for quantities, pre-allocate.",
+      why: (I) => `${I.items.map((x) => `${esc(x[0].split(",")[0].split("(")[0].trim())} → ${["CP", "AP", "escrow"][x[1]]}`).join("; ")}.`,
+    },
+    /* 37 */ {
+      id: "dist-quorum-loss-drill",
+      name: "Find the weakest point",
+      kind: "Design review",
+      skills: ["design", "diagnose"],
+      w: "topo",
+      sense: "min",
+      vname: "failures:",
+      gen(lv, R) {
+        const azs = R.pick([["a", "b", "c"], ["1a", "1b", "1c"]]);
+        const layout = lv === 1 ? [1, 1, 1] : lv === 2 ? [3, 2] : [2, 2];
+        const nodes = [], links = [];
+        const W = 640, cols = layout.length;
+        layout.forEach((cnt, z) => {
+          const x = Math.round((W / cols) * (z + 0.5));
+          const sw = nodes.length;
+          nodes.push({ label: `AZ ${azs[z]} switch`, x, y: 50, cls: "muted" });
+          for (let k = 0; k < cnt; k++) { const idx = nodes.length; nodes.push({ label: `etcd-${idx}`, sub: `AZ ${azs[z]}`, x: x + (k - (cnt - 1) / 2) * 120, y: 200 + (k % 2) * 60, voter: true }); links.push([sw, idx]); }
+        });
+        const sws = nodes.map((n, i) => (n.voter ? -1 : i)).filter((i) => i >= 0);
+        for (let i = 0; i < sws.length; i++) for (let j = i + 1; j < sws.length; j++) links.push([sws[i], sws[j], "inter-AZ"]);
+        nodes.forEach((n, i) => { if (n.voter) n.label = `etcd-${nodes.slice(0, i + 1).filter((x) => x.voter).length}`; });
+        return { lv, nodes, links, azs, sys: R.pick(["etcd", "the Raft-based metadata store", "the Consul servers"]) };
+      },
+      text: (I) => `<p>Before a game day, you're checking ${esc(I.sys)}: ${I.nodes.filter((n) => n.voter).length} voting members placed as shown. Fail <b>nodes</b> (members or AZ switches) and cut <b>links</b> to find the <b>smallest set of failures</b> that leaves no group of connected members with a quorum, i.e. the cluster can't commit writes.</p>`,
+      ui: (I) => ({ nodes: I.nodes.map((n) => ({ label: n.label, sub: n.sub, x: n.x, y: n.y, cls: n.cls })), links: I.links, mode: "both", H: 300, live: (a) => { const r = quorumTopo(I, a || {}); return K.metrics([{ name: "Largest connected group", value: `${r.best} member${r.best === 1 ? "" : "s"}`, ok: null }, { name: "Quorum", value: String(r.need), ok: null }, { name: "Writes", value: r.ok ? "still available" : "unavailable", ok: r.ok ? null : true }]); } }),
+      valid: (I, a) => (quorumTopo(I, a).ok ? "a connected majority still exists" : true),
+      val: (I, a) => (a.down || []).length + (a.cut || []).length,
+      bad: () => [{ down: [], cut: [] }],
+      hint: (I) => I.lv === 1 ? "With one member per AZ, how many members must be lost or isolated?" : I.lv === 2 ? "A whole AZ can disappear in one event. How many members are in the biggest one?" : "Count members on each side of the only inter-AZ link.",
+      concept: "Quorum loss and failure domains",
+      how: "A consensus cluster stays writable while some connected group holds a majority of all voting members. The useful question in a design review is the smallest set of correlated failures (an AZ switch, a link, a node) that removes every majority. With members spread one per zone over three zones, it takes two independent failures. Putting a majority in one zone makes that zone a single point of failure; an even split across two zones means one link cut leaves two halves with no majority and no way to break the tie. A third site, even a small witness or tie-breaker, fixes both.",
+      rule: "Spread voters over at least three failure domains with no domain holding half or more of them, and test the 'one domain down' case explicitly.",
+      why: (I, sol) => `${sol.down.length + sol.cut.length} failure${sol.down.length + sol.cut.length === 1 ? "" : "s"} suffice${sol.down.length + sol.cut.length === 1 ? "s" : ""}: ${[...sol.down.map((i) => "lose " + I.nodes[i].label), ...sol.cut.map((i) => "cut " + I.nodes[I.links[i][0]].label.replace(" switch", "") + "–" + I.nodes[I.links[i][1]].label.replace(" switch", ""))].join(", ")}. ${I.lv === 1 ? "One member per AZ needs two independent failures." : I.lv === 2 ? "Three of five members in one AZ: losing that AZ removes the majority." : "Two AZs with two members each: cutting the link leaves 2 + 2, and neither half has 3."}`,
+    },
+    /* 38 */ {
+      id: "dist-split-brain",
+      name: "Cause a split brain",
+      kind: "Experiment",
+      skills: ["diagnose", "safe"],
+      w: "topo",
+      sense: "min",
+      vname: "links cut:",
+      gen(lv, R) {
+        const db = R.pick(["pg-1", "db-a", "mysql-1"]), sb = R.pick(["pg-2", "db-b", "mysql-2"]);
+        const nodes = [{ label: db, sub: "primary", x: 140, y: 150 }, { label: sb, sub: "standby", x: 500, y: 150 }];
+        const links = [[0, 1, "heartbeat"]];
+        if (lv > 1) { nodes.push({ label: "witness", sub: "arbiter", x: 320, y: 40 }); links.push([0, 2], [1, 2]); }
+        const a1 = nodes.length; nodes.push({ label: "app-1", x: 220, y: 265 }); const a2 = nodes.length; nodes.push({ label: "app-2", x: 420, y: 265 });
+        links.push([a1, 0], [a1, 1], [a2, 0], [a2, 1]);
+        return { lv, nodes, links, witness: lv > 1, apps: [a1, a2] };
+      },
+      text: (I) => `<p>A primary/standby database pair with automatic failover. ${I.lv === 1 ? "The standby promotes itself when it misses the primary's heartbeats." : I.lv === 2 ? "The standby promotes only if it can't reach the primary <b>and</b> the witness confirms it can't reach the primary either. The old primary keeps accepting writes until someone stops it." : "The standby promotes as in the witness setup. To avoid split brain, the primary now demotes itself when it's isolated; the code treats it as isolated only if it can reach <b>none</b> of: the standby, the witness, or any app server."}</p>
+        <p>As a chaos experiment, cut the <b>fewest links</b> so that <b>both</b> nodes accept writes from app servers at the same time.</p>`,
+      ui: (I) => ({ nodes: I.nodes.map((n) => ({ label: n.label, sub: n.sub, x: n.x, y: n.y })), links: I.links, mode: "links", H: 300, live: (a) => { const r = splitBrain(I, a && a.cut); return K.metrics([{ name: `${esc(I.nodes[0].label)}`, value: r.pStays ? (r.pWrites ? "primary, taking writes" : "primary, no clients") : "demoted", ok: null }, { name: `${esc(I.nodes[1].label)}`, value: r.sPromotes ? (r.sWrites ? "promoted, taking writes" : "promoted, no clients") : "standby", ok: null }, { name: "Split brain", value: r.split ? "yes: two primaries" : "no", ok: r.split ? true : null }]); } }),
+      valid: (I, a) => (splitBrain(I, a.cut).split ? true : "only one node is accepting writes"),
+      val: (I, a) => (a.cut || []).length,
+      bad: () => [{ down: [], cut: [] }],
+      hint: (I) => I.lv === 1 ? "What does the standby conclude when only the heartbeat link fails?" : I.lv === 2 ? "The witness must lose the primary too, while the standby still reaches the witness." : "Which of the primary's 'can I still see someone?' checks is not a vote at all?",
+      concept: "Split brain and fencing the old primary",
+      how: "Failover based on 'I can't see the primary' confuses a dead primary with a network partition; if the standby promotes while the old primary is alive and reachable by clients, both accept writes and the histories diverge. A witness (arbiter) helps the standby decide, but safety also requires the old primary to stop: it must step down when it loses contact with a quorum of the failover group (standby + witness), or be fenced (STONITH, revoking its storage or network access, or fencing tokens). Clients are not quorum members: being able to reach app servers says nothing about whether a new primary exists.",
+      rule: "Promote only with a quorum's agreement, make the old primary step down when it loses that quorum (or fence it), and never count clients as votes.",
+      why: (I, sol) => `Cutting ${sol.cut.map((i) => `${I.nodes[I.links[i][0]].label}–${I.nodes[I.links[i][1]].label}`).join(" and ")} makes the standby promote while the old primary still serves an app. ${I.lv === 3 ? "The primary stayed up because it could still reach app servers, which aren't part of the quorum." : I.lv === 2 ? "Nothing told the old primary to stop." : "A single heartbeat link was the only evidence of the primary's death."}`,
+    },
+    /* 39 */ {
+      id: "dist-etcd-recovery",
+      name: "Nurse the etcd cluster",
+      kind: "Incident",
+      skills: ["diagnose", "safe"],
+      ...LB.term({
+        shell: (I) => etcdShell(I),
+        goal(st, I) {
+          if (st.wiped) return "The data directory is gone.";
+          const healthy = st.members.filter((m) => m.up && m.started).length;
+          if (I.lv === 1) {
+            if (st.members.some((m) => !m.up)) return `The dead member ${I.names[I.dead]} is still in the member list, so quorum still counts it.`;
+            if (!st.members.some((m) => m.ip === I.newIp)) return "The replacement member hasn't been added.";
+            if (!st.members.find((m) => m.ip === I.newIp).started) return "The new member is added but not started.";
+            return healthy >= 3 ? true : "Fewer than 3 healthy members.";
+          }
+          if (I.lv === 2) { if (st.alarm) return "The NOSPACE alarm is still active, so writes still fail."; return true; }
+          if (!st.forced) return "The cluster still has no quorum; nothing can be written.";
+          if (st.flag) return "ETCD_FORCE_NEW_CLUSTER is still set: the next restart would rewrite membership again.";
+          return st.members.some((m) => m.started) ? true : "etcd isn't running on the survivor.";
+        },
+        solve: (I) => I.lv === 1 ? { log: ["etcdctl member list -w table", `etcdctl member remove ${I.ids[I.dead]}`, `etcdctl member add ${I.newName} --peer-urls=https://${I.newIp}:2380`, `ssh ${I.newName} sudo systemctl start etcd`] }
+          : I.lv === 2 ? { log: ["etcdctl alarm list", "etcdctl endpoint status -w json", `etcdctl compact ${I.rev}`, "etcdctl defrag --cluster", "etcdctl alarm disarm"] }
+            : { log: ["etcdctl member list -w table", "etcdctl snapshot save /backup/etcd-pre-recovery.db", `ssh ${I.names[I.alive]} sudo systemctl stop etcd`, `ssh ${I.names[I.alive]} "echo ETCD_FORCE_NEW_CLUSTER=true | sudo tee -a /etc/etcd/etcd.env"`, `ssh ${I.names[I.alive]} sudo systemctl start etcd`, `ssh ${I.names[I.alive]} "sudo sed -i '/ETCD_FORCE_NEW_CLUSTER/d' /etc/etcd/etcd.env"`] },
+      }),
+      gen(lv, R) {
+        const base = R.pick(["10.0.1.", "10.20.4.", "172.16.8."]), ips = R.distinct(4, 10, 99).map((x) => base + x);
+        const ids = U.range(4).map(() => R.str(16, "0123456789abcdef"));
+        const names = ["etcd-1", "etcd-2", "etcd-3"];
+        return { lv, ips: ips.slice(0, 3), ids: ids.slice(0, 3), newId: ids[3], names, newName: "etcd-4", newIp: ips[3], dead: R.int(0, 2), alive: R.int(0, 2), cluster: R.str(16, "0123456789abcdef"), rev: R.int(4000000, 9000000), term: R.int(4, 40), idx: R.int(1e6, 9e6), quota: 2, live: K.round(R.int(6, 12) / 10, 1) };
+      },
+      bad: (I) => I.lv === 1 ? [{ log: [`etcdctl member add ${I.newName} --peer-urls=https://${I.newIp}:2380`, `ssh ${I.newName} sudo systemctl start etcd`] }, { log: [`etcdctl member remove ${I.ids[(I.dead + 1) % 3]}`] }]
+        : I.lv === 2 ? [{ log: ["etcdctl alarm disarm"] }, { log: ["etcdctl defrag --cluster", "etcdctl alarm disarm"] }]
+          : [{ log: [`ssh ${I.names[I.alive]} "echo ETCD_FORCE_NEW_CLUSTER=true | sudo tee -a /etc/etcd/etcd.env"`, `ssh ${I.names[I.alive]} sudo systemctl restart etcd`, `ssh ${I.names[I.alive]} "sudo sed -i '/ETCD_FORCE_NEW_CLUSTER/d' /etc/etcd/etcd.env"`] }, { log: ["etcdctl snapshot save /backup/x.db", `ssh ${I.names[I.alive]} "echo ETCD_FORCE_NEW_CLUSTER=true | sudo tee -a /etc/etcd/etcd.env"`, `ssh ${I.names[I.alive]} sudo systemctl restart etcd`] }],
+      text: (I) => `<p>You're on the bastion with <code>etcdctl</code> 3.5 for the control-plane etcd (3 members). Read the alert above the prompt and restore a healthy, writable cluster without making things worse. Type <code>help</code> for what this sandbox understands.</p>`,
+      hint: (I) => I.lv === 1 ? "Which order keeps the quorum requirement satisfiable at every step: remove, then add, or add, then remove?" : I.lv === 2 ? "Space is reclaimed in three steps: drop old revisions, return free pages to the filesystem, then clear the alarm." : "Without quorum, membership can't be changed normally. The survivor can be forced into a new one-member cluster; take a backup first and don't leave the flag behind.",
+      concept: "Operating a Raft cluster: membership, space and quorum loss",
+      how: "Membership changes are themselves Raft writes and need a quorum. To replace a dead member, remove it first (quorum is then computed over the remaining members), then add the replacement and start it with initial-cluster-state=existing; adding first raises the quorum size while a member is still dead. etcd's backend keeps every revision until compaction; when the database hits its quota it raises a NOSPACE alarm and rejects writes: compact old revisions, defragment to give pages back to the filesystem, then disarm the alarm. If a majority is permanently lost, the survivor's data can be turned into a new single-member cluster (--force-new-cluster, or restoring a snapshot), after which the flag must be removed and new members added one by one.",
+      rule: "Remove before you add, compact + defrag + disarm for NOSPACE, and for quorum loss take a snapshot, force a new cluster from the best survivor once, then rebuild membership.",
+      why: (I) => I.lv === 1 ? `Removing ${I.names[I.dead]} first left a healthy 2-member cluster (quorum 2); adding ${I.newName} then needed 2 of 3, which the running members had.` : I.lv === 2 ? `The backend had reached its ${I.quota} GB quota. Compaction marked old revisions free, defrag returned the space, and only then could the alarm stay cleared.` : `${I.names[I.alive]} alone can't form a quorum of 3. A snapshot protects against a botched recovery; forcing a new cluster makes it a 1-member cluster with all its data, and removing the flag prevents it from being re-applied on the next restart.`,
+    },
+    /* 40 */ {
+      id: "dist-retry-amplification",
+      name: "Count the retry amplification",
+      kind: "Estimate",
+      skills: ["estimate", "diagnose"],
+      w: "num",
+      gen(lv, R) {
+        const layers = lv === 1 ? [["mobile app", R.pick([2, 3])], ["API gateway", R.pick([2, 3])], ["orders service", R.pick([2, 3])]]
+          : [["web client", R.pick([1, 2])], ["edge proxy", R.pick([1, 2])], ["BFF", R.pick([2, 3])], [lv === 3 ? "orders service's DB client (per query)" : "orders service", R.pick([2, 3])]];
+        const q = lv === 3 ? R.pick([2, 3]) : 1;
+        return { lv, layers, q, rps: R.pick([200, 500, 800]) };
+      },
+      text: (I) => `<p>The database behind the orders service is down; every call to it fails after its timeout. Each layer retries a failed downstream call this many times (attempts = retries + 1):</p>${K.table(["layer", "retries on failure"], I.layers.map(([n, r]) => [esc(n), String(r)]), { compact: true })}${I.lv === 3 ? `<p>Each orders-service request runs <b>${I.q}</b> database queries in sequence (it keeps going after a failed one to fill in partial data), and its DB client retries each query as shown in the last row.</p>` : ""}<p>At <b>${I.rps}</b> user requests/s, how many ${I.lv === 3 ? "database queries" : "calls to the orders service"} per second hit the failing tier${I.lv === 1 ? " (count attempts at the deepest layer listed)" : ""}?</p>`,
+      ui: () => ({ unit: "per second" }),
+      accept: LB.near((I) => ampTruth(I), 0.1),
+      solve: (I) => ampTruth(I),
+      bad: (I) => [I.rps * K.sum(I.layers.map(([, r]) => r + 1)), I.rps * (I.layers[I.layers.length - 1][1] + 1)],
+      hint: () => "Attempts multiply through the layers: each attempt from above triggers a full set of attempts below.",
+      concept: "Retry amplification across layers",
+      how: "When every layer of a call chain retries independently, attempts multiply: three layers that each try 3 times turn one user request into 27 calls at the bottom, exactly when the bottom is failing. This is how small outages become retry storms. The standard fix is to retry at one layer only (usually closest to the failure or at the edge), use retry budgets and backoff everywhere else, and propagate deadlines so inner layers stop once the caller has given up.",
+      rule: "Retry at a single layer; everywhere else fail fast, and cap total retries with a budget.",
+      why: (I) => `Attempts multiply: ${I.layers.map(([, r]) => r + 1).join(" × ")}${I.lv === 3 ? ` × ${I.q} queries` : ""} = ${K.num(ampTruth(I) / I.rps)} per user request, so ${K.num(ampTruth(I))}/s hit the failing tier, against ${I.rps}/s of real demand.`,
+    },
+  ]);
+  function ampTruth(I) { return I.rps * I.layers.reduce((p, [, r]) => p * (r + 1), 1) * I.q; }
 })();

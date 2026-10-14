@@ -109,7 +109,7 @@
     const tmax = Math.max(...ops.map((o) => o.e)) + 5, W = 560, lh = 34, H = 22 + clients.length * lh;
     const X = (t) => 70 + (t / tmax) * (W - 80);
     const rows = clients.map((c, k) => `<text x="4" y="${26 + k * lh}" font-size="12" fill="currentColor">${esc(c)}</text><line x1="70" x2="${W - 10}" y1="${22 + k * lh}" y2="${22 + k * lh}" stroke="currentColor" stroke-opacity=".15"/>`).join("");
-    const bars = ops.map((o) => { const y = 12 + clients.indexOf(o.c) * lh; return `<rect x="${X(o.s)}" y="${y}" width="${Math.max(6, X(o.e) - X(o.s))}" height="20" rx="4" fill="${o.k === "w" ? "#1c7ed6" : "#2f9e44"}" fill-opacity=".22" stroke="currentColor" stroke-opacity=".5"/><text x="${X(o.s) + 4}" y="${y + 14}" font-size="11" fill="currentColor">${esc(o.id)}: ${o.k === "w" ? "write " + o.v : "read → " + o.v}</text>`; }).join("");
+    const bars = ops.map((o) => { const y = 12 + clients.indexOf(o.c) * lh; return `<rect x="${X(o.s)}" y="${y}" width="${Math.max(6, X(o.e) - X(o.s))}" height="20" rx="4" fill="${o.k === "w" ? "#1c7ed6" : "#2f9e44"}" fill-opacity=".22" stroke="currentColor" stroke-opacity=".5"/><text x="${X(o.s) + 3}" y="${y + 14}" font-size="10" fill="currentColor">${esc(o.id)}${o.k === "w" ? " w(" + o.v + ")" : "→" + o.v}</text>`; }).join("");
     const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => `<text x="${X(f * tmax)}" y="${H - 1}" font-size="10" fill="currentColor" fill-opacity=".6" text-anchor="middle">${Math.round(f * tmax)} ms</text>`).join("");
     return `<figure class="lab-chart"><svg viewBox="0 0 ${W} ${H + 12}" role="img" aria-label="Operation history timeline">${rows}${bars}${ticks}</svg></figure>`;
   }
@@ -279,7 +279,7 @@
           { c: cl[3], k: "r", v: v1, s: T(58), e: T(66) },
           { c: cl[2], k: "r", v: v2, s: T(75), e: T(85) },
           { c: cl[3], k: "r", v: v1, s: T(72), e: T(82) },
-          { c: cl[0], k: "r", v: 0, s: T(4), e: T(14) },
+          { c: cl[3], k: "r", v: 0, s: T(4), e: T(14) },
         ];
         // label ops: writes W1.., reads R1.. in start order
         ops.sort((a, b) => a.s - b.s);
@@ -907,7 +907,7 @@
     }
     return { ...S, offered, good, att, qd, p99: K.quantile(S.lat, 0.99), succ: S.n ? S.ok / S.n : 1, amp: S.n ? S.attempts / S.n : 1 };
   }
-  const simChart = (r, o) => K.chart([{ name: "offered (req/s)", pts: r.offered, cls: "s1" }, { name: "attempts incl. retries", pts: r.att, cls: "s2" }, { name: "goodput", pts: r.good, cls: "good" }], { title: o.title || "Requests per second", xlabel: "s", vline: o.vline, h: 150 });
+  const simChart = (r, o) => K.chart([{ name: "offered (req/s)", pts: r.offered, cls: "s0" }, { name: "attempts incl. retries", pts: r.att, cls: "bad" }, { name: "goodput", pts: r.good, cls: "good" }], { title: o.title || "Requests per second", xlabel: "s", vline: o.vline, h: 150 });
 
   /* retry storm (scenario 15) */
   function retryRun(I, cfg) {

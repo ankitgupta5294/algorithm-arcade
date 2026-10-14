@@ -148,7 +148,7 @@
       },
       text: (I) => `<p><code>${I.svc}</code> (Go 1.22, so the runtime sees all <b>32</b> host CPUs, not its cgroup limit) averages <b>${I.u} cores</b>, but every few periods a burst of ~<b>${I.G} ms</b> of CPU work (GC plus parallel fan-out) runs on as many threads as GOMAXPROCS allows. p99 must stay under <b>${I.target} ms</b> (it's ${I.base} ms without contention), and average use must stay under 80% of the limit.</p><p>CFS enforces <code>cpu.max</code> per 100 ms period: once the quota is used up, every thread waits for the next period. Pick the <b>smallest CPU limit</b> that meets the target${I.lv > 1 ? "; you may also set GOMAXPROCS" : ""}.</p>`,
       ui: (I) => ({
-        knobs: [{ k: "limit", label: "CPU limit (cpu.max)", opts: [1, 2, 3, 4, 6, 8], unit: "cores" }, I.lv === 1 ? { k: "gmp", label: "GOMAXPROCS", opts: ["unset (sees 32)"], fixed: "unset (sees 32)" } : { k: "gmp", label: "GOMAXPROCS", opts: ["unset (sees 32)", "2", "4", "6", "8"] }],
+        knobs: [{ k: "limit", label: "CPU limit (cpu.max)", opts: [1, 2, 3, 4, 6, 8], fmt: (v) => v + (v === 1 ? " core" : " cores") }, I.lv === 1 ? { k: "gmp", label: "GOMAXPROCS", opts: ["unset (sees 32)"], fixed: "unset (sees 32)" } : { k: "gmp", label: "GOMAXPROCS", opts: ["unset (sees 32)", "2", "4", "6", "8"] }],
         init: { limit: 1, gmp: "unset (sees 32)" },
         live: (c) => { const r = cpuSim(I, c); return K.metrics([{ name: "Throttled periods", value: K.pct(r.thrPct, 0), ok: r.thrPct === 0, target: "nr_throttled / nr_periods" }, { name: "Throttle per burst", value: K.ms(r.throttle), ok: r.throttle === 0 }, { name: "Average use of limit", value: K.pct(r.avgPct, 0), ok: r.avgPct <= 0.8, target: "≤ 80%" }, { name: "p99 latency", value: K.ms(r.p99), ok: r.p99 <= I.target, target: `< ${I.target} ms` }]) + K.bars([{ label: "base", value: I.base, note: K.ms(I.base) }, { label: "burst stall", value: 0.5 * r.stall, note: K.ms(0.5 * r.stall) }, { label: "throttled", value: r.throttle, cls: r.throttle ? "bad" : "", note: K.ms(r.throttle) }, { label: "spill-over", value: r.carry, note: K.ms(r.carry) }]); },
       }),
@@ -393,7 +393,169 @@
       rule: "Run services as a dedicated user with exactly the capabilities they need (AmbientCapabilities + CapabilityBoundingSet), never setcap an interpreter or add setuid bits, and grant write access to specific paths (StateDirectory=, ReadWritePaths=/var/lib/x).",
       why: (I) => I.lv === 1 ? `User=root gives ${I.svc} every privilege to bind one port. Keep User=${I.svc} and add AmbientCapabilities=CAP_NET_BIND_SERVICE.` : I.lv === 2 ? "setcap on /usr/bin/python3.12 lets every Python program on the host bind low ports (and runs as root on each start via '+'), and CAP_SYS_ADMIN is effectively root. AmbientCapabilities=CAP_NET_BIND_SERVICE alone is enough." : `ReadWritePaths=/ makes the whole filesystem writable again, cancelling ProtectSystem=strict; the helper only needs StateDirectory=${I.svc} (already added). chmod u+s makes the helper setuid root for any local user.`,
     },
-    // @@more@@
-    // @@more@@
+    /* ======================================================================== */
+    {
+      id: "linux-sysctl-folklore",
+      name: "Triage the tuning blog post",
+      kind: "Decision",
+      skills: ["tune", "diagnose"],
+      w: "classify",
+      gen(lv, R) {
+        const POOL = {
+          1: [["net.ipv4.tcp_tw_recycle=1 to clear 40k server-side TIME-WAIT sockets", 1], ["net.ipv4.tcp_fin_timeout=10 to shorten TIME-WAIT", 1], ["LimitNOFILE=65536 for a service failing with 'too many open files' at 1024", 0], ["fs.file-max=2097152 for that same service", 1], ["echo 3 > /proc/sys/vm/drop_caches every 5 minutes because 'free' shows little free memory", 2]],
+          2: [["net.core.somaxconn=4096 when ss shows Send-Q 128 but the app calls listen() with 4096", 0], ["net.core.somaxconn=65535 when Send-Q is already 4096 and Recv-Q stays at 0", 1], ["vm.overcommit_memory=2 on a host where an in-memory store uses 70% of RAM and forks for snapshots", 2], ["net.ipv4.tcp_tw_reuse=1 on a client exhausting ephemeral ports to one upstream", 0], ["kernel.pid_max raised because a container hit its cgroup pids.max", 1], ["fs.file-max raised for a service hitting its 1024 per-process limit", 1]],
+          3: [["vm.min_free_kbytes set to 25% of RAM 'to avoid OOM'", 2], ["net.netfilter.nf_conntrack_max raised on a host logging 'table full, dropping packet'", 0], ["ip_local_port_range=1024 65535 on a host whose services listen on 8080 and 9100, with no reserved ports", 2], ["net.ipv4.tcp_syncookies=0 'to speed up handshakes' on an internet-facing load balancer", 2], ["transparent_hugepage=always on a latency-sensitive store that forks for snapshots", 2], ["net.core.rmem_max=16 MB for traffic that never leaves a 0.2 ms-RTT LAN at 1 Gb/s", 1], ["net.ipv4.tcp_tw_recycle=1 on kernel 6.8", 1]],
+        }[lv];
+        const items = R.shuffle(POOL.slice());
+        return { lv, items: items.map((x) => x[0]), cls: items.map((x) => x[1]) };
+      },
+      text: (I) => `<p>A widely shared "Linux performance tuning" post recommends the changes below. Your hosts run kernel 6.8. For each one, in the situation described, decide whether it <b>helps</b>, has <b>no effect</b>, or is <b>harmful</b>.</p>`,
+      ui: (I) => ({ items: I.items, cats: ["Helps", "No effect", "Harmful"] }),
+      ans: (I) => I.cls,
+      diag: () => "Some of these change a different limit than the one being hit, and some no longer exist.",
+      hint: (I) => I.lv === 1 ? "TIME-WAIT is fixed at 60 s in Linux. fs.file-max is system-wide; the error was per-process." : I.lv === 2 ? "somaxconn caps what the app asks for; it can't raise what the app didn't ask for. overcommit_memory=2 is strict accounting." : "Reserve some memory, yes; a quarter of RAM, no. And check whether a knob still exists.",
+      concept: "Separating kernel tuning facts from folklore",
+      how: "Most kernel knobs fix one specific limit, and only help when that limit is the one being hit. tcp_tw_recycle broke clients behind NAT and was removed in Linux 4.12; tcp_fin_timeout controls FIN-WAIT-2, not TIME-WAIT (fixed at 60 s). fs.file-max is the system-wide handle limit, separate from each process's RLIMIT_NOFILE. somaxconn caps the backlog an app requests. vm.overcommit_memory=2 makes fork() of a large process fail when commit accounting is exceeded. Dropping caches throws away useful page cache. A huge min_free_kbytes keeps memory idle and triggers reclaim and OOM early. Disabling syncookies removes SYN-flood protection.",
+      rule: "Before applying any tuning advice, name the exact limit you're hitting (with a counter or error message), change only the knob that controls it, and measure. Ignore anything that targets a different limit or a removed setting.",
+      why: (I) => `${I.items.map((t, k) => `<b>${["Helps", "No effect", "Harmful"][I.cls[k]]}</b>: ${esc(t)}`).join("<br>")}`,
+    },
+    /* ======================================================================== */
+    {
+      id: "linux-memory-reclaim",
+      name: "What can the kernel reclaim?",
+      kind: "Investigation",
+      skills: ["diagnose", "estimate"],
+      w: "classify",
+      gen(lv, R) {
+        const POOL = [["inactive_file: clean page cache not used recently", 0, 1], ["anon: heap and stack memory of processes", 2, 1], ["slab_reclaimable: dentry and inode caches", 0, 1], ["file_dirty: modified page cache not yet written to disk", 1, 1], ["kernel_stack: kernel stacks of the cgroup's threads", 2, 2], ["active_file: clean page cache used recently", 0, 2], ["shmem: files in tmpfs (/dev/shm, emptyDir medium: Memory)", 2, 2], ["file_writeback: page cache being written to disk right now", 1, 3], ["unevictable: memory locked with mlock()", 2, 3], ["slab_unreclaimable: kernel objects in use (sockets, page tables, …)", 2, 3]];
+        const items = R.shuffle(POOL.filter((x) => x[2] <= lv));
+        return { lv, items: items.map((x) => x[0]), cls: items.map((x) => x[1]), mb: items.map(() => R.int(1, 40) * 50) };
+      },
+      text: (I) => `<p>A container is near its memory limit and you need to know how much of its <code>memory.stat</code> the kernel could free under pressure (there's no swap). Classify each counter.</p>${K.table(["Counter", "Size"], I.items.map((t, k) => [`<code>${esc(t.split(":")[0])}</code>`, hs(I.mb[k])]), { compact: true })}`,
+      ui: (I) => ({ items: I.items, cats: ["Reclaimable (clean)", "Reclaimable after writeback", "Not reclaimable here"], live: (a) => { if (!a) return ""; const s = [0, 1, 2].map((c) => I.mb.reduce((t, v, k) => t + (a[k] === c ? v : 0), 0)); return K.bars([{ label: "Reclaimable now", value: s[0], cls: "good", note: hs(s[0]) }, { label: "After writeback", value: s[1], note: hs(s[1]) }, { label: "Stuck", value: s[2], cls: "bad", note: hs(s[2]) }]); } }),
+      ans: (I) => I.cls,
+      diag: () => "Clean file pages can simply be dropped; dirty ones must be written first; anything with no backing file needs swap or its owner to free it.",
+      hint: (I) => I.lv === 1 ? "Is there a copy of this data on disk?" : I.lv === 2 ? "tmpfs files live only in memory." : "mlock() exists precisely to stop reclaim.",
+      concept: "Reclaimable vs unreclaimable memory",
+      how: "Under pressure the kernel reclaims memory that has a backing store: clean page cache can be dropped at once (inactive first, then active), dirty page cache must be written back first, and reclaimable slab (dentry and inode caches) can be shrunk. Anonymous memory and shmem/tmpfs have no file behind them, so without swap they stay until the owner frees them. mlock()ed pages are unevictable by design, and unreclaimable slab and kernel stacks belong to live kernel objects. That's why 'used' memory overstates pressure, and why a cgroup full of anon or shmem gets OOM-killed while one full of clean cache doesn't.",
+      rule: "Estimate real pressure as anon + shmem + unevictable + unreclaimable kernel memory, and treat dirty data as reclaimable only as fast as the disk can write it.",
+      why: (I) => { const s = [0, 1, 2].map((c) => I.mb.reduce((t, v, k) => t + (I.cls[k] === c ? v : 0), 0)); return `Of ${hs(s[0] + s[1] + s[2])} listed, ${hs(s[0])} could be dropped immediately, ${hs(s[1])} after writeback, and ${hs(s[2])} can't be reclaimed without swap or the owner freeing it.`; },
+    },
+    /* ======================================================================== */
+    {
+      id: "linux-triage-snapshot",
+      name: "Read the 60-second triage",
+      kind: "Investigation",
+      skills: ["diagnose"],
+      w: "select",
+      gen(lv, R) {
+        const c = lv === 1 ? 8 : lv === 2 ? 8 : 16;
+        let snap, st;
+        if (lv === 1) {
+          const r = R.int(13, 18);
+          snap = `$ uptime\n load average: ${r}.21, ${r - 1}.80, ${r - 2}.02\n$ vmstat 1 3\n r  b   swpd   free   buff  cache   si   so    bi    bo  us sy id wa st\n${r}  0      0 412220  81200 21002330   0    0     2    40  92  6  2  0  0\n${r + 1}  0      0 411980  81200 21002410   0    0     0    36  93  6  1  0  0\n$ free -m\n               total   used   free  shared  buff/cache  available\nMem:           31812   9120    402      18       22290      22101\n$ iostat -xz 1 1\nDevice   r/s   w/s  r_await w_await aqu-sz %util\nnvme0n1  0.4  12.0    0.21    0.40   0.01   0.8`;
+          st = [["The run queue is longer than the number of CPUs (8)", true], ["Most CPU time is user time", true], ["Disk I/O is the bottleneck", false], ["The host is about to run out of memory: only 402 MB is free", false], ["CPU steal is high", false], ["The host is swapping", false]];
+        } else if (lv === 2) {
+          const si = R.int(800, 2400);
+          snap = `$ uptime\n load average: 9.40, 8.10, 6.22\n$ vmstat 1 3\n r  b   swpd   free  buff  cache    si    so    bi    bo  us sy id wa st\n 3  6 3120440  61200  1020  88120  ${si}  ${si + 412}  ${si + 300}  ${si + 500}  12 21 31 36  0\n 2  7 3121001  60880  1020  87900  ${si + 120}  ${si + 300}  ${si + 410}  ${si + 610}  11 22 30 37  0\n$ free -m\n               total   used   free  shared  buff/cache  available\nMem:            7940   7710     60       4         170         110\nSwap:           4095   3047   1048\n$ ps -eo pid,comm,%cpu --sort=-%cpu | head -3\n  PID COMMAND  %CPU\n   88 kswapd0  41.2\n 4121 java     30.1`;
+          st = [["The host is swapping actively in both directions", true], ["Available memory is under 2% of RAM", true], ["Freeing buff/cache would solve it", false], ["CPU user time is the bottleneck", false], ["CPU steal is high", false], ["The run queue is longer than the number of CPUs", false]];
+        } else {
+          const aw = R.int(150, 320);
+          snap = `$ uptime\n load average: 21.30, 19.80, 18.41\n$ vmstat 1 2\n r  b   swpd    free   buff   cache  si so    bi    bo  us sy id wa st\n 3 18      0 9120440  91200 40220110   0  0 41220  2210   6  9 71 14  0\n$ mpstat -P ALL 1 1\nCPU  %usr  %sys %iowait  %soft  %idle\nall   6.1   2.0    14.0    6.2   71.7\n  0   1.0   0.9     0.0   98.1    0.0\n  1   7.2   2.1    15.0    0.1   75.6\n  …  (14 more CPUs like CPU 1)\n$ iostat -xz 1 1\nDevice   r/s    w/s  r_await w_await aqu-sz %util\nnvme0n1  2.0   18.0    0.20    0.30   0.01   0.9\nsdb    188.0   20.0  ${aw}.00   88.00  41.20  99.6\n$ free -m\n               total   used   free  shared  buff/cache  available\nMem:           64212  12110   8901      40       43201       51020`;
+          st = [["Most of the load comes from tasks blocked on I/O, not runnable tasks", true], ["One CPU is saturated by softirq (interrupt) processing", true], ["The sdb disk is saturated", true], ["The CPUs are saturated overall", false], ["The host is swapping", false], ["Adding worker threads would increase throughput", false]];
+        }
+        const sh = R.shuffle(st.slice());
+        return { lv, snap, opts: sh.map((x) => x[0]), truth: sh.map((x, i) => (x[1] ? i : -1)).filter((i) => i >= 0), cores: c };
+      },
+      text: (I) => `<p>A host (${I.cores} CPUs) is slow. You ran the first-minute triage commands:</p>${K.pre(I.snap)}<p>Select every statement the output supports (<b>${I.truth.length}</b>).</p>`,
+      ui: (I) => ({ opts: I.opts, k: I.truth.length }),
+      ans: (I) => I.truth,
+      diag: () => "Check each claim against a specific number in the output.",
+      hint: (I) => I.lv === 1 ? "Compare r with the CPU count, and 'free' with 'available'." : I.lv === 2 ? "si/so are pages swapped in and out per second; buff/cache is already tiny." : "Load counts runnable (r) and blocked (b) tasks. Look at each CPU, not just 'all'.",
+      concept: "First-minute triage",
+      how: "A quick pass over uptime, vmstat, mpstat -P ALL, iostat -xz and free -m answers most 'the box is slow' questions: vmstat's r (runnable) vs CPU count shows CPU saturation and b shows tasks blocked on I/O; si/so show swapping; us/sy/wa/st split CPU time; mpstat reveals a single hot CPU (often interrupt or softirq processing) hidden by the average; iostat's await and aqu-sz show device saturation; free's 'available' (not 'free') says how much memory can still be used.",
+      rule: "Use a fixed checklist (load, run queue, per-CPU, disk await/queue, memory available and swap) and tie every conclusion to a number. Averages hide one hot CPU or one saturated disk.",
+      why: (I) => `True here: ${I.truth.map((i) => esc(I.opts[i])).join("; ")}.`,
+    },
+    /* ======================================================================== */
+    {
+      id: "linux-memory-headroom",
+      name: "How many more workers fit?",
+      kind: "Capacity plan",
+      skills: ["estimate"],
+      w: "num",
+      gen(lv, R) {
+        const T = R.pick([31812, 63924]), W = R.pick([600, 800, 1200]);
+        const avail = Math.round(T * R.int(40, 60) / 100), buff = Math.round(avail * 0.8), shared = lv === 2 ? R.int(5, 8) * 1024 : R.int(10, 60);
+        const free = Math.round(avail * 0.18), used = T - free - buff - (lv === 2 ? shared : 0);
+        const I = { lv, T, W, avail, buff: buff + (lv === 2 ? shared : 0), shared, free, used };
+        if (lv === 3) { I.max = 24 * 1024; I.anon = R.int(110, 140) * 100; I.file = R.int(60, 80) * 100; I.inact = Math.round(I.file * 0.85); }
+        I.truth = lv === 3 ? Math.floor(Math.min(I.max * 0.9 - (I.anon + I.file - I.inact), I.avail - 0.1 * T) / W) : Math.floor((avail - 0.1 * T) / W);
+        if (I.truth < 1) return null;
+        return I;
+      },
+      text: (I) => `<p>Each new worker process uses about <b>${K.num(I.W)} MB</b> RSS (anonymous memory). Keep at least <b>10% of the host's RAM</b> available as headroom${I.lv === 3 ? ", and inside the workers' cgroup keep 10% of its limit free" : ""}. No swap.</p>${K.pre(`$ free -m\n               total        used        free      shared  buff/cache   available\nMem:           ${String(I.T).padStart(5)}       ${String(I.used).padStart(5)}       ${String(I.free).padStart(5)}       ${String(I.shared).padStart(5)}       ${String(I.buff).padStart(5)}       ${String(I.avail).padStart(5)}${I.lv === 2 ? `\n$ df -h /dev/shm\ntmpfs  ${Math.round(I.T / 2048)}G  ${(I.shared / 1024).toFixed(1)}G  …  /dev/shm` : ""}`)}${I.lv === 3 ? `<p>The workers run in <code>workers.slice</code>:</p>${K.pre(`memory.max      ${I.max * 1048576}\nmemory.stat:\n  anon          ${I.anon * 1048576}\n  file          ${I.file * 1048576}\n  inactive_file ${I.inact * 1048576}`)}` : ""}<p>How many more workers can you start?</p>`,
+      ui: () => ({ unit: "workers" }),
+      accept: (I, a) => (a == null || !Number.isFinite(a) ? "Enter a number." : Math.abs(a - I.truth) <= 1 ? true : a > I.truth ? "Too many: you'd eat into the headroom or hit a limit. Which number really tells you what's usable?" : "Too few: some of that 'used' memory can be reclaimed."),
+      solve: (I) => I.truth,
+      bad: (I) => [Math.floor((I.free - 0.1 * I.T) / I.W) - 3, I.lv === 3 ? Math.floor((I.avail - 0.1 * I.T) / I.W) + 2 : Math.floor((I.free + I.buff - 0.1 * I.T) / I.W) + 2].filter((x) => Math.abs(x - I.truth) > 1),
+      hint: (I) => I.lv === 1 ? "'free' ignores page cache the kernel can drop; 'available' estimates what new allocations can use." : I.lv === 2 ? "buff/cache includes tmpfs (shared). Can that be dropped?" : "Two limits apply: the host's available memory and the cgroup's limit minus its working set (usage minus inactive_file).",
+      concept: "Reading free: available vs free",
+      how: "free's 'free' column is memory nobody is using at all, usually small on a healthy host because Linux uses spare RAM as page cache. 'available' (MemAvailable) estimates how much can be allocated without swapping: free memory plus page cache and reclaimable slab that can be dropped, minus reserves. buff/cache also includes shmem (tmpfs, shared memory), which can't be dropped without swap, and 'available' already excludes it. Inside a cgroup, the limit applies separately: usable room is memory.max minus the working set (usage minus inactive file cache).",
+      rule: "Plan capacity from 'available' (and, in containers, memory.max minus working set), keep explicit headroom, and never from 'free' or from free + buff/cache.",
+      why: (I) => I.lv === 3 ? `Host: (${K.num(I.avail)} − ${K.num(Math.round(I.T * 0.1))}) / ${I.W} ≈ ${Math.floor((I.avail - 0.1 * I.T) / I.W)}. Cgroup: 90% of ${K.num(I.max)} MB minus a working set of ${K.num(I.anon + I.file - I.inact)} MB leaves room for ${Math.floor((I.max * 0.9 - (I.anon + I.file - I.inact)) / I.W)}. The smaller wins: <b>${I.truth}</b>.` : `(available ${K.num(I.avail)} − 10% of ${K.num(I.T)}) / ${I.W} MB = <b>${I.truth}</b> workers.${I.lv === 2 ? ` buff/cache includes ${(I.shared / 1024).toFixed(1)} GB of tmpfs that can't be reclaimed, which 'available' already accounts for.` : " 'free' alone would suggest almost none."}`,
+    },
+    /* ======================================================================== */
+    {
+      id: "linux-disk-runway",
+      name: "When does the disk fill up?",
+      kind: "Estimate",
+      skills: ["estimate"],
+      w: "num",
+      gen(lv, R) {
+        const size = R.pick([500, 1000, 2000]), used = Math.round(size * R.int(82, 88) / 100), avail = Math.round(size - used - size * 0.05);
+        const I = { lv, size, used, avail };
+        if (lv === 1) { I.g = R.int(15, 30) / 10; I.truth = avail / I.g; }
+        else if (lv === 2) { I.g = R.int(30, 50) / 10; I.free3 = R.int(20, 40); I.now = 21; const pre = 6 * I.g; if (avail <= pre) return null; I.truth = 6 + (avail - pre + I.free3) / I.g; }
+        else { I.hi = R.int(25, 40) / 10; I.lo = 0.5; I.now = 14; let left = avail, t = 0, h = I.now; while (left > 0 && t < 500) { const rate = h >= 9 && h < 17 ? I.hi : I.lo; if (left <= rate) { t += left / rate; left = 0; break; } left -= rate; t += 1; h = (h + 1) % 24; } I.truth = t; }
+        return I;
+      },
+      text: (I) => `<p>A database volume, filled by a non-root service:</p>${K.pre(`$ df -h /var/lib/data\nFilesystem      Size  Used Avail Use% Mounted on\n/dev/nvme1n1    ${I.size}G  ${I.used}G   ${I.avail}G  ${Math.ceil(I.used / (I.used + I.avail) * 100)}% /var/lib/data`)}<p>${I.lv === 1 ? `It grows a steady <b>${I.g} GB/hour</b>.` : I.lv === 2 ? `It's 21:00. It grows <b>${I.g} GB/hour</b>, and a cleanup job at <b>03:00</b> deletes old partitions, freeing <b>${I.free3} GB</b> at once.` : `It's 14:00. It grows <b>${I.hi} GB/hour</b> during business hours (09:00-17:00) and <b>${I.lo} GB/hour</b> otherwise.`}</p><p>In how many hours will the service get <code>ENOSPC</code>?</p>`,
+      ui: () => ({ unit: "hours" }),
+      accept: LB.near((I) => I.truth, 0.1),
+      solve: (I) => Math.round(I.truth * 10) / 10,
+      bad: (I) => [(I.size - I.used) / (I.lv === 3 ? (I.hi * 8 + I.lo * 16) / 24 : I.g) * (I.lv === 2 ? 1 : 1) + (I.lv === 2 ? 8 : 0), I.lv === 3 ? I.avail / ((I.hi * 8 + I.lo * 16) / 24) : I.avail / I.g + 30].filter((x) => Math.abs(x - I.truth) > I.truth * 0.1).map((x) => Math.round(x * 10) / 10),
+      hint: (I) => I.lv === 1 ? "Size − Used includes the 5% that ext4 reserves for root. Which column already excludes it?" : I.lv === 2 ? "Walk the timeline: until 03:00, then the cleanup, then growth again." : "Average rates lie when growth depends on the time of day. Step through the hours.",
+      concept: "Disk runway and reserved blocks",
+      how: "ext4 reserves 5% of blocks for root by default (tune2fs -m); df's Avail excludes them, so Size − Used overstates what a non-root service can write. Runway is Avail divided by the growth rate, but real growth is uneven: periodic cleanup frees space in steps and traffic follows the clock, so walk the timeline instead of dividing by an average. Linear-prediction alerts (e.g. predict_linear over a few hours) catch most of these before they page at 100%.",
+      rule: "Compute runway from Avail, model known step changes and daily patterns, and alert on time-to-full rather than on a fixed percentage.",
+      why: (I) => I.lv === 1 ? `${I.avail} GB available / ${I.g} GB/h ≈ <b>${(I.truth).toFixed(1)} h</b>. Size − Used (${I.size - I.used} GB) would include the ${Math.round(I.size * 0.05)} GB reserved for root.` : I.lv === 2 ? `Until 03:00 (6 h) it uses ${(6 * I.g).toFixed(1)} GB, leaving ${(I.avail - 6 * I.g).toFixed(1)} GB; the cleanup adds ${I.free3} GB; then ${(I.avail - 6 * I.g + I.free3).toFixed(1)} / ${I.g} ≈ ${((I.avail - 6 * I.g + I.free3) / I.g).toFixed(1)} h more: <b>${I.truth.toFixed(1)} h</b> total.` : `From 14:00: 3 h at ${I.hi} GB/h, then 16 h at ${I.lo} GB/h overnight, then ${I.hi} GB/h again from 09:00 until the ${I.avail} GB runs out: <b>${I.truth.toFixed(1)} h</b>. A 24-hour average rate gets this wrong.`,
+    },
+    /* ======================================================================== */
+    {
+      id: "linux-docker-prune",
+      name: "Reclaim Docker disk space at 3 a.m.",
+      kind: "Decision",
+      skills: ["safe", "diagnose"],
+      w: "choice",
+      gen(lv, R) {
+        const opts = lv === 1 ? ["docker image prune -a -f && docker builder prune -a -f", "docker system prune -a --volumes -f", "rm -rf /var/lib/docker/overlay2/*", "systemctl restart docker"]
+          : lv === 2 ? ["docker builder prune -f --filter until=72h", "docker builder prune -a -f", "docker image prune -a -f", "docker system prune -a --volumes -f"]
+            : ["docker volume prune -f", "docker volume prune -a -f", "docker system prune -a -f", "docker image prune -a -f && docker builder prune -a -f"];
+        return { lv, opts: R.shuffle(opts.slice()), right: opts[0], need: R.int(35, 45) };
+      },
+      text: (I) => {
+        const df = I.lv === 1 ? "Images          142       9         61.2GB    48.7GB (79%)\nContainers      14        9         2.1GB     0.4GB (19%)\nLocal Volumes   23        6         140.3GB   38.2GB (27%)\nBuild Cache     812       0         22.4GB    22.4GB" : I.lv === 2 ? "Images          31        12        18.2GB    2.1GB (11%)\nContainers      12        12        0.8GB     0B (0%)\nLocal Volumes   4         4         3.1GB     0B (0%)\nBuild Cache     4120      0         96.4GB    96.4GB" : "Images          28        11        14.0GB    6.2GB (44%)\nContainers      11        11        0.9GB     0B (0%)\nLocal Volumes   1840      7         171.2GB   152.6GB (89%)\nBuild Cache     210       0         3.1GB     3.1GB";
+        return `<p><code>/var/lib/docker</code> on a ${I.lv === 1 ? "shared staging host" : "CI runner"} is at 96% and you need about <b>${I.need} GB</b> back. ${I.lv === 1 ? "A stopped <code>pg-staging</code> container keeps the staging database in a named volume; people restart it in the morning." : I.lv === 2 ? "Builds depend on the last few days of layer cache to stay under 5 minutes." : "Integration tests run <code>docker run</code> without <code>--rm</code>, and their images declare <code>VOLUME /data</code>. A stopped container's named volume <code>pgdata</code> holds the test fixture database that takes hours to rebuild."} Docker Engine 27.</p>${K.pre("$ docker system df\nTYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\n" + df)}<p>Which command do you run?</p>`;
+      },
+      ui: (I) => ({ opts: I.opts }),
+      ans: (I) => I.right,
+      diag: (I) => I.lv === 1 ? "Which of these can delete the staging database?" : I.lv === 2 ? "Both builder prunes free space; only one keeps builds fast." : "Where is the reclaimable space, and which prune variant spares named volumes?",
+      hint: (I) => I.lv === 1 ? "--volumes removes every volume not used by a running container." : I.lv === 2 ? "Builder prune can filter by age." : "Since Docker 23, docker volume prune removes only anonymous volumes unless you add -a.",
+      concept: "Cleaning up Docker storage safely",
+      how: "docker system df shows reclaimable space by type. docker image prune -a removes images not used by any container; docker builder prune removes BuildKit cache (with --filter until=… to keep recent entries); docker volume prune removes unused volumes, only anonymous ones by default since Docker 23, and named ones too with -a. docker system prune --volumes also deletes unused volumes, which is how stopped databases lose their data. Deleting files under /var/lib/docker by hand corrupts Docker's state.",
+      rule: "Look at docker system df first, prune the category that holds the space with the narrowest command, never use --volumes or volume prune -a on hosts with stateful containers, and fix the source (--rm, log and cache limits, BuildKit GC).",
+      why: (I) => I.lv === 1 ? "Unused images and build cache hold ~71 GB, enough. system prune --volumes would also delete pg-staging's named volume because the container is stopped." : I.lv === 2 ? "Build cache holds 96 GB; pruning entries older than 72 h frees most of it while keeping the layers recent builds reuse. Pruning all of it makes every build cold." : "The space is in 1,800+ anonymous volumes left by tests without --rm. docker volume prune (Docker 23+) removes only anonymous unused volumes, sparing pgdata; -a would delete it, and image/builder prunes don't free enough. Then add --rm to the test runs.",
+    },
   ]);
 })();
