@@ -11,7 +11,8 @@
     const need = P.need(I), seen = new Set();
     for (const k of keys) {
       if (!k) return "Pick steps from the list.";
-      if (P.trap[k]) return `<b>${esc(P.text[k])}</b>: ${P.trap[k]}`;
+      const tr = typeof P.trap[k] === "function" ? P.trap[k](I) : P.trap[k];
+      if (tr) return `<b>${esc(P.text[k])}</b>: ${tr}`;
       if (!need.includes(k)) return `"${esc(P.text[k])}" isn't needed for this change.`;
       for (const b of P.before[k] || []) if (need.includes(b) && !seen.has(b)) return `"${esc(P.text[k])}" comes too early: it needs "${esc(P.text[b])}" first.`;
       seen.add(k);
@@ -746,7 +747,7 @@
     sense: "min",
     vname: "an extra cost of",
     vfmt: (v) => K.usd(v) + "/month",
-    gen(lv, R) { return { lv, q: lv === 1 ? R.pick([8, 12, 20]) : R.pick([180, 240, 360]), perDay: R.int(8, 30), upd: R.int(2, 8) * 1000, row: 300, bloat: lv === 3 ? 20 : 60, base: 0.3, lagMax: lv === 1 ? 60 : 5, lockConf: 0, repCost: R.int(9, 16) * 100 }; },
+    gen(lv, R) { return { lv, q: lv === 1 ? R.pick([8, 12, 20]) : R.pick([180, 240, 360]), perDay: R.int(8, 30), upd: R.int(2, 8) * 1000, row: 300, bloat: lv === 1 ? 60 : lv === 2 ? 15 : 20, base: 0.3, lagMax: lv === 1 ? 60 : 5, lockConf: 0, repCost: R.int(9, 16) * 100 }; },
     text: (I) => `<p>The analytics team runs reports of up to <b>${I.q} minutes</b> on the streaming replica that also serves the app's read traffic. About ${I.perDay} a day die with <code>ERROR: canceling statement due to conflict with recovery</code> (VACUUM on the primary removed rows the report still needed). The primary takes ${K.num(I.upd)} updates/s.</p>
       <p>Constraints: no cancelled reports; the app's replica must stay within <b>${I.lagMax} s</b> of the primary; extra dead rows kept on the primary must stay under <b>${I.bloat} GB</b>. Minimise extra cost (a dedicated analytics replica costs ${K.usd(I.repCost)}/month).</p>`,
     ui: (I) => ({ knobs: [
@@ -936,7 +937,211 @@
   });
   const scVal = (I, c) => { const ssn = I.lv === 3 ? c.ssn : "FIRST 1 (s1)"; return Math.round(SC_CLASSES(I).reduce((s, x) => s + x.tps * scLat(I, c[x.k], ssn), 0)); };
 
-  /* @@MORE@@ */
+  /* ======================= 18. safe schema migrations (steps) ======================= */
+  const MIG = {
+    text: {
+      lt: "Run every DDL statement with SET lock_timeout = '2s' and retry on timeout",
+      fill: "Backfill: UPDATE orders SET currency = 'USD' WHERE currency IS NULL, in batches of 10k rows",
+      chk: "ALTER TABLE orders ADD CONSTRAINT currency_nn CHECK (currency IS NOT NULL) NOT VALID;",
+      val: "ALTER TABLE orders VALIDATE CONSTRAINT currency_nn;",
+      setnn: "ALTER TABLE orders ALTER COLUMN currency SET NOT NULL; (uses the validated CHECK, no scan)",
+      dropchk: "ALTER TABLE orders DROP CONSTRAINT currency_nn;",
+      t_direct: "ALTER TABLE orders ALTER COLUMN currency SET NOT NULL; straight away",
+      t_onebig: "UPDATE orders SET currency = 'USD' WHERE currency IS NULL; as one statement",
+      idx: "CREATE INDEX CONCURRENTLY orders_customer_id_idx ON orders (customer_id);",
+      fk: "ALTER TABLE orders ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES customers (id) NOT VALID;",
+      orphan: "Find orders whose customer_id has no customer and fix them, in batches",
+      vfk: "ALTER TABLE orders VALIDATE CONSTRAINT orders_customer_fk;",
+      t_fk: "ALTER TABLE orders ADD FOREIGN KEY (customer_id) REFERENCES customers (id); (validated immediately)",
+      t_idx: "CREATE INDEX orders_customer_id_idx ON orders (customer_id);",
+      add: "ALTER TABLE accounts ADD COLUMN plan text NOT NULL DEFAULT 'free'; (metadata-only since PG11)",
+      dedupe: "Find duplicate emails and resolve them with the account owners",
+      uidx: "CREATE UNIQUE INDEX CONCURRENTLY accounts_email_key ON accounts (email);",
+      chkinv: "Check pg_index.indisvalid; if the build failed, DROP INDEX CONCURRENTLY the INVALID index and build it again",
+      cons: "ALTER TABLE accounts ADD CONSTRAINT accounts_email_key UNIQUE USING INDEX accounts_email_key;",
+      t_unique: "ALTER TABLE accounts ADD CONSTRAINT accounts_email_key UNIQUE (email);",
+      t_addslow: "ADD COLUMN plan text; backfill 'free' in batches; then SET DEFAULT and SET NOT NULL",
+    },
+    pool: (lv) => lv === 1 ? ["lt", "fill", "chk", "val", "setnn", "dropchk", "t_direct", "t_onebig"] : lv === 2 ? ["lt", "idx", "fk", "orphan", "vfk", "t_fk", "t_idx", "fill"] : ["lt", "add", "dedupe", "uidx", "chkinv", "cons", "t_unique", "t_addslow", "t_idx"],
+    need: (I) => I.lv === 1 ? ["lt", "fill", "chk", "val", "setnn", "dropchk"] : I.lv === 2 ? ["lt", "idx", "fk", "orphan", "vfk"] : ["lt", "add", "dedupe", "uidx", "chkinv", "cons"],
+    before: { fill: ["lt"], chk: ["lt"], val: ["chk", "fill"], setnn: ["val"], dropchk: ["setnn"], idx: ["lt"], fk: ["lt"], orphan: ["fk"], vfk: ["fk", "orphan"], add: ["lt"], dedupe: ["lt"], uidx: ["dedupe"], chkinv: ["uidx"], cons: ["chkinv"] },
+    trap: {
+      t_direct: "SET NOT NULL on a column with no validated CHECK scans all rows under an ACCESS EXCLUSIVE lock: every query on orders blocks for the whole scan.",
+      t_onebig: "one statement updating millions of rows holds their row locks until the end, bloats the table and floods replicas with WAL.",
+      t_fk: "a validating ADD FOREIGN KEY scans the whole table while holding a SHARE ROW EXCLUSIVE lock that blocks writes to orders.",
+      t_idx: "a plain CREATE INDEX blocks every write to the table for the whole build.",
+      t_unique: "ADD CONSTRAINT ... UNIQUE builds its index while blocking all writes to accounts.",
+      t_addslow: "since Postgres 11 a constant DEFAULT is stored in the catalog: ADD COLUMN ... NOT NULL DEFAULT 'free' is instant. The batched backfill is hours of unnecessary writes.",
+    },
+  };
+  S.push({
+    id: "pg-safe-migrations",
+    name: "Plan a zero-downtime schema change",
+    kind: "Change plan",
+    skills: ["safe"],
+    ...planDef(MIG),
+    gen(lv, R) { return { lv, keys: planKeys(MIG, lv, R), rows: R.int(2, 6) * 100 }; },
+    text: (I) => `<p>${I.lv === 1 ? `<code>orders.currency</code> (${I.rows}M rows) is nullable, and old rows have NULLs. The app now always writes it. Make the column <b>NOT NULL</b>.` : I.lv === 2 ? `<code>orders.customer_id</code> (${I.rows}M rows) has no foreign key and no index; a few old rows may point at deleted customers. Add the <b>foreign key</b> to <code>customers(id)</code> (customers are deleted by a GDPR job, which then has to check orders).` : `On <code>accounts</code> (${I.rows}M rows): add a column <code>plan text NOT NULL DEFAULT 'free'</code> and make <code>email</code> <b>unique</b> (a handful of duplicates exist).`}</p><p>The table serves thousands of queries per second; no step may block writes for more than a moment. Order the steps; some are traps.</p>`,
+    bad: (I) => [MIG.need(I).map((k) => I.keys.indexOf(k === "chk" ? "t_direct" : k === "fk" ? "t_fk" : k === "uidx" ? "t_unique" : k)).filter((i) => i >= 0).concat(I.lv === 1 ? [] : []), MIG.need(I).slice().reverse().map((k) => I.keys.indexOf(k))],
+    hint: (I) => I.lv === 1 ? "SET NOT NULL can skip its full-table check if a validated CHECK (col IS NOT NULL) constraint already proves it (PG12+). NOT VALID constraints are checked for new rows only; VALIDATE checks old rows under a weaker lock." : I.lv === 2 ? "Foreign keys can also be added NOT VALID and validated later. Validation fails if orphans remain." : "Which ADD COLUMN forms are metadata-only? And a unique constraint can adopt an index built concurrently.",
+    concept: "Lock-friendly DDL: NOT VALID, VALIDATE, CONCURRENTLY",
+    how: "Many ALTER TABLE forms take an ACCESS EXCLUSIVE lock, harmless if instant but an outage if they scan or rewrite a big table. Adding a CHECK or FOREIGN KEY constraint NOT VALID is instant and enforces it for new writes; VALIDATE CONSTRAINT then checks existing rows holding only a SHARE UPDATE EXCLUSIVE lock (reads and writes continue). Since PG12, SET NOT NULL skips its scan when a validated CHECK (col IS NOT NULL) exists. Since PG11, ADD COLUMN with a constant default is metadata-only. Indexes are built with CREATE INDEX CONCURRENTLY, and a unique or primary key constraint can adopt one with ADD CONSTRAINT ... USING INDEX. Every DDL statement should carry a short lock_timeout so it can't queue traffic behind it.",
+    rule: "Split every risky constraint into an instant NOT VALID step and an online VALIDATE step, build indexes CONCURRENTLY, backfill in batches, and wrap each DDL in a short lock_timeout with retries.",
+    why: (I) => I.lv === 1 ? "The NOT VALID check is instant and protects new rows; the batched backfill fixes old ones; VALIDATE scans without blocking writes; SET NOT NULL then trusts the validated check, and the redundant CHECK can go." : I.lv === 2 ? "The concurrent index keeps the GDPR job's cascading checks fast, the NOT VALID foreign key starts protecting new rows immediately, and VALIDATE checks history once the orphans are fixed, without blocking writes." : "ADD COLUMN with a constant default is instant (PG11+). The unique index is built concurrently after deduplication, checked for an INVALID leftover, and attached as the constraint with USING INDEX, so the only exclusive lock is momentary.",
+  });
+
+  /* ======================= 19. point-in-time recovery (steps) ======================= */
+  const PITR = {
+    text: {
+      find: "Find the exact transaction: grep the server log (log_statement = 'mod') for the DELETE and note its time and XID",
+      arch: "Check pg_stat_archiver: archiving has succeeded continuously since the last base backup before the incident (no failed_count gap)",
+      newhost: "Provision a separate recovery server; leave production running",
+      restore: "Restore the latest base backup taken BEFORE the incident onto the recovery server",
+      cfgT: "Set restore_command to fetch WAL from the archive and recovery_target_time = 'the second before the DELETE'",
+      cfgX: "Set restore_command and recovery_target_xid = '<the DELETE's XID>' with recovery_target_inclusive = false",
+      pause: "Set recovery_target_action = 'pause', create recovery.signal, start Postgres",
+      verify: "Verify on the paused server: the rows exist and the DELETE isn't applied (if not, adjust the target and restart recovery)",
+      copyback: "Copy the deleted rows back into production (COPY out, then INSERT ... ON CONFLICT DO NOTHING), keeping everything written since",
+      t_prod: "Restore the base backup over the production primary's data directory",
+      t_latest: "Restore the most recent base backup (taken 40 minutes after the incident)",
+      t_standby: "Create standby.signal instead of recovery.signal",
+      t_promote: "Promote the recovered server and point the application at it",
+      t_incl: "Set recovery_target_xid = '<the DELETE's XID>' and leave recovery_target_inclusive at its default",
+    },
+    pool: (lv) => ["newhost", "restore", "pause", "verify", "copyback", "t_prod", "t_latest", "t_promote", ...(lv === 1 ? ["cfgT", "t_standby"] : ["find", "cfgX", "t_incl", "cfgT"]), ...(lv === 3 ? ["arch"] : [])],
+    need: (I) => [...(I.lv >= 2 ? ["find"] : []), ...(I.lv === 3 ? ["arch"] : []), "newhost", "restore", I.lv === 1 ? "cfgT" : "cfgX", "pause", "verify", "copyback"],
+    before: { restore: ["newhost", "arch"], cfgT: ["restore"], cfgX: ["restore", "find"], pause: ["cfgT", "cfgX"], verify: ["pause"], copyback: ["verify"] },
+    trap: {
+      t_prod: "you'd destroy production and every write since the backup, plus take the service down for the whole restore.",
+      t_latest: "a backup taken after the DELETE already lacks the rows: recovery can only move forward from a base backup.",
+      t_standby: "standby.signal makes the server a standby that follows the archive forever instead of stopping at the target.",
+      t_promote: "promoting the restored copy as production throws away every legitimate write made since the incident.",
+      t_incl: "recovery_target_inclusive defaults to true: recovery stops just after the target transaction, so the DELETE is replayed.",
+      cfgT: (I) => I.lv === 1 ? null : "several transactions committed within the same second as the DELETE (300 commits/s): a time target either replays the DELETE or drops legitimate commits. Target the XID.",
+    },
+  };
+  S.push({
+    id: "pg-point-in-time-recovery",
+    name: "Recover from an accidental DELETE",
+    kind: "Incident",
+    skills: ["safe", "comms"],
+    ...planDef(PITR),
+    gen(lv, R) { return { lv, keys: planKeys(PITR, lv, R), t: `${R.int(10, 16)}:${String(R.int(10, 59)).padStart(2, "0")}`, rows: R.int(20, 90) * 1000 }; },
+    text: (I) => `<p>At <b>${I.t} UTC</b> a support engineer ran <code>DELETE FROM invoices WHERE customer_id = 4711 OR true</code> on production: ${K.num(I.rows)} invoices are gone. The app keeps running and taking new orders. You have nightly base backups and continuous WAL archiving.${I.lv >= 2 ? " The database commits about 300 transactions per second." : ""}${I.lv === 3 ? " Last week someone saw an alert about archive_command failures." : ""}</p><p>Plan the recovery, in order. Some steps are traps.</p>`,
+    bad: (I) => [[I.keys.indexOf("t_prod")], PITR.need(I).map((k) => I.keys.indexOf(k === "copyback" ? "t_promote" : k))],
+    hint: (I) => I.lv === 1 ? "Restore to a different server, replay WAL up to just before the mistake, and stop there." : I.lv === 2 ? "A time target is ambiguous when hundreds of transactions commit each second. Is there a more precise target, and which side of it do you stop on?" : "PITR needs every WAL segment from the base backup to the target. How would you know none is missing?",
+    concept: "Point-in-time recovery",
+    how: "PITR restores a base backup and replays archived WAL up to a recovery target (time, XID, LSN or named restore point), then stops. It needs a base backup taken before the target and an unbroken chain of WAL segments from that backup to the target. recovery.signal requests targeted recovery (standby.signal would keep following WAL). recovery_target_inclusive (default true) decides whether the target transaction itself is applied; with an XID target you want false to stop just before the mistake. recovery_target_action = 'pause' lets you inspect before deciding. Do it on a separate server, then copy the lost rows back into production, so writes made since the incident are kept.",
+    rule: "Practise PITR regularly, monitor pg_stat_archiver, recover to a separate server with a precise target (XID or LSN) and pause, then copy the missing data back instead of rolling production back.",
+    why: (I) => `Recovery happens beside production: the backup from before ${I.t} plus archived WAL replayed ${I.lv === 1 ? "to the second before the DELETE" : "up to, but not including, the DELETE's XID"}, paused for inspection, then the ${K.num(I.rows)} invoices are copied back without losing the orders written since.${I.lv === 3 ? " Checking the archiver first matters: one missing segment makes everything after it unrecoverable." : ""}`,
+  });
+
+  /* ======================= 20. Patroni failover and partitions (topo) ======================= */
+  const PAT_NODES = [
+    { label: "AZ-a", sub: "etcd-1", x: 100, y: 125 }, { label: "AZ-b", sub: "etcd-2", x: 320, y: 40 }, { label: "AZ-c", sub: "etcd-3", x: 540, y: 125 },
+    { label: "pg1", sub: "leader", x: 100, y: 235 }, { label: "pg2", sub: "replica", x: 470, y: 40 }, { label: "pg3", sub: "replica", x: 540, y: 235 },
+    { label: "app", sub: "via HAProxy", x: 320, y: 290, fixed: true },
+  ];
+  const PAT_LINKS = [[0, 1, "a–b"], [1, 2, "b–c"], [0, 2, "a–c"], [3, 0], [4, 1], [5, 2], [6, 0], [6, 1], [6, 2]];
+  function patSim(I, a) {
+    const down = new Set(a.down || []), cut = new Set(a.cut || []);
+    const siteUp = [0, 1, 2].map((i) => !down.has(i));
+    const adj = [[], [], []];
+    [[0, 1, 0], [1, 2, 1], [0, 2, 2]].forEach(([x, y, li]) => { if (!cut.has(li) && siteUp[x] && siteUp[y]) { adj[x].push(y); adj[y].push(x); } });
+    const comp = [-1, -1, -1]; let nc = 0;
+    for (let s = 0; s < 3; s++) if (siteUp[s] && comp[s] < 0) { const st = [s]; comp[s] = nc; while (st.length) { const u = st.pop(); adj[u].forEach((v) => { if (comp[v] < 0) { comp[v] = nc; st.push(v); } }); } nc++; }
+    const size = Array(nc).fill(0); comp.forEach((c) => { if (c >= 0) size[c]++; });
+    const qc = size.findIndex((n) => n >= 2);
+    const pgUp = [0, 1, 2].map((i) => siteUp[i] && !down.has(3 + i));
+    const pgIn = [0, 1, 2].map((i) => pgUp[i] && !cut.has(3 + i) && qc >= 0 && comp[i] === qc);
+    let leader = -1, lossy = false;
+    if (pgIn[0]) leader = 0;
+    else if (qc >= 0) { if (pgIn[1]) leader = 1; else if (pgIn[2] && !I.sync) { leader = 2; lossy = true; } }
+    let writes = false;
+    if (leader >= 0) { const s = leader; const reach = new Set(); [0, 1, 2].forEach((i) => { if (siteUp[i] && !cut.has(6 + i)) reach.add(i); }); const seen = new Set(reach), st = [...reach]; while (st.length) { const u = st.pop(); adj[u].forEach((v) => { if (!seen.has(v)) { seen.add(v); st.push(v); } }); } writes = seen.has(s); }
+    return { quorum: qc >= 0, leader, writes, lossy, pgUp, allPgUp: pgUp.every(Boolean), healthyReplicaInQuorum: [1, 2].some((i) => pgIn[i]) };
+  }
+  const patGoal = (I, a) => {
+    const r = patSim(I, a);
+    if (I.lv === 1) return r.leader > 0 && r.writes ? true : r.leader === 0 ? "pg1 is still the leader: nothing triggered a failover." : "No new leader takes writes.";
+    if (I.lv === 2) return r.allPgUp && !r.writes ? true : !r.allPgUp ? "A Postgres node is down; the goal is an outage with all three databases still running." : "Clients can still write.";
+    return !r.writes && r.quorum && r.healthyReplicaInQuorum ? true : !r.quorum ? "etcd has lost quorum: that outage is expected. Find one where etcd is healthy and a replica is too." : !r.healthyReplicaInQuorum ? "No healthy replica is reachable: there's nothing to promote." : "Writes still work.";
+  };
+  S.push({
+    id: "pg-patroni-failover",
+    name: "Break the Patroni cluster on purpose",
+    kind: "Experiment",
+    skills: ["diagnose", "design"],
+    w: "topo",
+    gen(lv, R) { return { lv, sync: lv === 3, ttl: R.pick([20, 30]), lag: R.pick(["1 MB", "4 MB"]) }; },
+    text: (I) => `<p>A Patroni cluster spans three availability zones: each AZ runs one etcd member and one Postgres node; <code>pg1</code> in AZ-a is the leader (it holds the leader key in etcd, TTL ${I.ttl} s). Clients reach the leader through HAProxy, which checks Patroni's REST API.${I.sync ? " <code>synchronous_mode: true</code> with pg2 as the synchronous standby; pg3 is asynchronous." : ""}</p>
+      <p>Game day: find a fault (click AZs or Postgres nodes to fail them, links to cut them) that ${I.lv === 1 ? "makes Patroni <b>fail over to a new leader that clients can write to</b>, using one fault" : I.lv === 2 ? "<b>stops all writes while all three Postgres servers keep running</b>, using three faults" : "<b>stops all writes even though etcd keeps quorum and a healthy replica is reachable</b>, using two faults"}.</p>`,
+    ui: (I) => ({ nodes: PAT_NODES.map((n, i) => (i === 4 && I.sync ? { ...n, sub: "sync standby" } : i === 5 && I.sync ? { ...n, sub: "async replica" } : n)), links: PAT_LINKS, mode: "both", k: I.lv === 1 ? 1 : I.lv === 2 ? 3 : 2, H: 320, nodeVerb: "failed", live: (a) => {
+      const r = patSim(I, a || {});
+      return K.metrics([{ name: "etcd quorum", value: r.quorum ? "yes" : "lost", ok: r.quorum }, { name: "Leader", value: r.leader < 0 ? "none (read-only)" : "pg" + (r.leader + 1), ok: r.leader >= 0 }, { name: "Clients can write", value: r.writes ? "yes" : "no", ok: null }]) + (r.lossy ? K.note("pg3 was asynchronous: commits it hadn't received are lost.", "bad") : "");
+    } }),
+    accept: (I, a) => patGoal(I, a),
+    solve(I, spec) { for (const s of LB.byId.get("pg-patroni-failover").space(I, spec)) if (patGoal(I, s) === true) return s; return null; },
+    bad: (I) => I.lv === 1 ? [{ down: [4], cut: [] }, { down: [], cut: [0] }] : I.lv === 2 ? [{ down: [3], cut: [0, 2] }, { down: [], cut: [0, 1, 3] }] : [{ down: [0, 1], cut: [] }, { down: [3], cut: [] }],
+    hint: (I) => I.lv === 1 ? "The leader must lose its leader key: it has to be unable to reach a majority of etcd." : I.lv === 2 ? "Patroni demotes the leader when it can't renew its key, and no one may take over without an etcd majority. Clients also need a path to the leader." : "With synchronous_mode, which replicas is Patroni allowed to promote?",
+    concept: "Patroni, DCS quorum and failover",
+    how: "Patroni stores the leader key in a distributed consensus store (etcd, Consul, ZooKeeper) with a TTL; the leader renews it every loop. If the leader can't reach a DCS majority, it demotes itself to read-only before the key expires, which is what prevents split brain; a replica that can reach the majority and is healthy (and not lagging beyond maximum_lag_on_failover) takes the key and is promoted. If the DCS loses quorum entirely, no node may be leader, so writes stop even though every database is up (unless failsafe_mode is enabled). With synchronous_mode, only the synchronous standby may be promoted, trading availability for zero data loss. HAProxy follows Patroni's REST health checks, so clients find the new leader.",
+    rule: "Spread DCS members across three failure domains, test failover regularly, alert on DCS quorum, and decide explicitly between synchronous_mode (no data loss, possible unavailability) and async failover (availability, bounded data loss).",
+    why: (I, sol) => { const r = patSim(I, sol); const what = [...(sol.down || []).map((i) => PAT_NODES[i].label + " fails"), ...(sol.cut || []).map((i) => "link " + (PAT_LINKS[i][2] || `${PAT_NODES[PAT_LINKS[i][0]].label}–${PAT_NODES[PAT_LINKS[i][1]].label}`) + " cut")].join(", "); return I.lv === 1 ? `${what}: pg1 can no longer renew its key with an etcd majority, so it demotes and pg${r.leader + 1} is promoted.` : I.lv === 2 ? `${what}: every Postgres process is running, but ${r.quorum ? "clients can't reach the leader" : "etcd has no majority anywhere, so Patroni keeps every node read-only rather than risk two leaders"}.` : `${what}: etcd still has quorum and pg3 is healthy, but under synchronous_mode only the synchronous standby pg2 may be promoted, so Patroni waits rather than lose acknowledged commits.`; },
+  });
+
+  /* ======================= 21. JSONB or columns (classify) ======================= */
+  const JB = [
+    { t: "tenant_id: every query filters on it; must reference tenants(id)", c: 0 },
+    { t: "price_cents: summed in revenue reports, must be > 0", c: 0 },
+    { t: "status: 6 values, filtered and indexed, changes several times per order", c: 0 },
+    { t: "300 vendor-specific attributes that differ by category, displayed on the product page, rarely filtered", c: 1 },
+    { t: "the raw webhook payload, kept 30 days for debugging", c: 1 },
+    { t: "user UI preferences: read and written as a whole by the app", c: 1 },
+    { t: "view_count: incremented on every page view", c: 0 },
+    { t: "shipping_address: validated, shown as a whole, never queried by its parts", c: 1 },
+    { t: "line items: up to hundreds per order, reported on by sku and joined to inventory", c: 2 },
+    { t: "price history: every change with its timestamp, queried for 'price on date X'", c: 2 },
+  ];
+  S.push({
+    id: "pg-jsonb-or-columns",
+    name: "Columns, JSONB or a table?",
+    kind: "Design review",
+    skills: ["design"],
+    w: "classify",
+    gen(lv, R) { const pool = lv === 3 ? JB.map((_, i) => i) : JB.map((x, i) => (x.c < 2 ? i : -1)).filter((i) => i >= 0); const pick = R.sample(pool, lv === 1 ? 5 : lv === 2 ? 7 : 8); if (lv === 3 && !pick.some((i) => JB[i].c === 2)) return null; if (lv >= 2 && !pick.includes(6)) return null; return { lv, items: pick }; },
+    text: (I) => `<p>A team is designing the <code>products</code>/<code>orders</code> schema and wants to put "everything flexible" in one <code>jsonb</code> column. For each piece of data, decide where it belongs${I.lv === 3 ? ": a regular column, a key inside a jsonb column, or its own table" : ""}.</p>`,
+    ui: (I) => ({ items: I.items.map((i) => JB[i].t), cats: I.lv === 3 ? ["Column", "JSONB", "Own table"] : ["Column", "JSONB"] }),
+    ans: (I) => I.items.map((i) => JB[i].c),
+    diag: () => "Not quite. Ask: is it filtered, joined, constrained, aggregated or updated on its own? Or is it read and written as a whole?",
+    hint: (I) => I.lv === 1 ? "Columns get types, constraints, foreign keys and accurate statistics. JSONB is good for data the database mostly stores and returns as a whole." : I.lv === 2 ? "What does updating one key of a jsonb value actually write?" : "Repeating groups that you query by their own fields are rows, not a document.",
+    concept: "JSONB vs columns",
+    how: "Regular columns get types, NOT NULL/CHECK/foreign-key constraints, per-column statistics for the planner and cheap updates. JSONB is good for sparse, varying or opaque attributes read and written as a unit, and GIN indexes support containment queries, but there are no per-key statistics (the planner guesses), no foreign keys, and updating any key rewrites the whole value (often TOASTed), so hot counters inside a document are expensive. Data with its own identity and many rows per parent, queried and joined by its own fields, belongs in a child table.",
+    rule: "Model what you filter, join, constrain, aggregate or update independently as columns or tables; keep JSONB for genuinely variable or opaque attributes handled as a whole.",
+    why: (I) => I.items.map((i) => `<code>${esc(JB[i].t.split(":")[0])}</code> → ${["column", "JSONB", "own table"][JB[i].c]}`).join("; ") + ".",
+  });
+
+  /* ======================= 22. major version upgrade (choice) ======================= */
+  const UPG = ["pg_dump / pg_restore into a new cluster", "pg_upgrade --link in place (after a rehearsal on a clone)", "pg_upgrade --copy", "Logical replication to a new cluster, then switch over"];
+  S.push({
+    id: "pg-major-upgrade",
+    name: "Pick the major-upgrade path",
+    kind: "Decision",
+    skills: ["design", "safe"],
+    w: "choice",
+    gen(lv, R) { return { lv, size: lv === 1 ? R.int(150, 400) : R.int(4, 9), from: R.pick([13, 14]), to: 17, window: lv === 1 ? 60 : 15, disk: R.int(55, 70) }; },
+    text: (I) => `<p>Production runs Postgres ${I.from} (${I.from === 13 ? "out of community support since November 2025" : "end of life in November 2026"}); the target is ${I.to}. Database: <b>${I.size} ${I.lv === 1 ? "GB" : "TB"}</b>, disk ${I.disk}% full. Maximum write downtime: <b>${I.window} minutes</b>.</p>
+      ${I.lv === 1 ? "<p>Rollback: restoring the pre-upgrade VM snapshot (taken during the window) is acceptable. Rehearsal on a clone took 3 minutes with --link; a dump/restore rehearsal took 2 h 40 min.</p>" : I.lv === 2 ? "<p>Rollback: the business wants to be able to <b>go back to the old version for a week</b> after the switch without losing writes, in case the new planner regresses critical queries. All tables have primary keys; no large objects.</p>" : "<p>Rollback: restoring the last backup is acceptable. But 40 large, update-heavy tables have <b>no primary key</b>, the app stores files as <b>large objects</b>, and the team has no time to change the schema first. A --link rehearsal on a clone took 6 minutes.</p>"}<p>Which path?</p>`,
+    ui: () => ({ opts: UPG }),
+    ans: (I) => (I.lv === 2 ? UPG[3] : UPG[1]),
+    diag: (I) => I.lv === 1 ? "That doesn't fit a 60-minute window on this database, or needs disk you don't have." : I.lv === 2 ? "After pg_upgrade --link starts the new cluster, the old one can't safely be started again: there's no week-long way back." : "Logical replication needs a primary key (or REPLICA IDENTITY FULL, which makes every UPDATE/DELETE scan the table on the subscriber) and doesn't carry large objects.",
+    hint: (I) => I.lv === 1 ? "Compare each option's downtime with the window and its disk needs with the free space." : I.lv === 2 ? "Which path leaves the old cluster untouched and able to take writes again?" : "What does logical replication need from every table, and what doesn't it replicate?",
+    concept: "Major version upgrade strategies",
+    how: "Major versions change the on-disk catalog format, so a binary upgrade needs pg_upgrade or a logical copy. pg_dump/pg_restore is simple but takes hours for large databases. pg_upgrade rewrites only the catalogs: --copy duplicates the data files (needs disk and time proportional to size), --link hard-links them (minutes, regardless of size) but once the new cluster has started the old one must not be used. Logical replication into a new-version cluster gives near-zero downtime and a way back (replicate in reverse), but requires a primary key or replica identity on every table and doesn't replicate DDL, sequence values or large objects. Before Postgres 18, pg_upgrade didn't carry planner statistics, so ANALYZE (vacuumdb --analyze-in-stages) afterwards; extensions must exist on the new version.",
+    rule: "Rehearse on a clone first. Use pg_upgrade --link when minutes of downtime are fine and rollback-by-restore is acceptable; use logical replication when you need near-zero downtime or a live way back and the schema supports it.",
+    why: (I) => I.lv === 1 ? `--link took 3 minutes in rehearsal; dump/restore needs hours, and --copy needs another ${I.size} GB on a disk that's ${I.disk}% full. The VM snapshot covers rollback.` : I.lv === 2 ? `On ${I.size} TB, logical replication lets the ${I.to} cluster catch up while ${I.from} keeps serving; the switch takes minutes, and replicating back from ${I.to} keeps the old cluster current for a week. (Remember to sync sequences before switching.)` : "Without primary keys and with large objects, logical replication would be slow for the 40 tables and would silently miss the files. A rehearsed pg_upgrade --link fits the window, with restore-from-backup as the agreed rollback.",
+  });
+
 
   LB.addAll("pg", S);
 })();

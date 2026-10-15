@@ -925,7 +925,7 @@
         return hitsHTML(r.res, I.cols || ["name"]);
       } }),
       accept: (I, src) => judge(I, src),
-      solve: (I) => I.ref,
+      solve: (I) => JP(JSON.parse(I.ref)),
       bad: (I) => I.bads,
     };
     delete def.make; delete def.check;
@@ -983,7 +983,7 @@
         return K.table(["Test", "Result", ""], e.rows.map((r) => [esc(r.t.name), r.got.err ? `<span class="lose small">${r.got.err}</span>` : `<span class="small">${showV(I, r.t, r.got.v)}</span>`, r.ok ? "✓" : "✗"]), { compact: true, cls: (row, i) => (e.rows[i].ok ? "good" : "bad") }) + (c !== true ? K.note(c, "bad") : "");
       } }),
       accept: (I, src) => judge(I, src),
-      solve: (I) => I.ref,
+      solve: (I) => JP(JSON.parse(I.ref)),
       bad: (I) => I.bads,
     };
     delete def.make; delete def.check;
@@ -1435,7 +1435,7 @@
         return r.res.aggregations ? K.pre(pj(r.res.aggregations).split("\n").slice(0, 60).join("\n")) : `<p class="muted small">${r.res.hits.total.value} hits, no aggregations.</p>`;
       } }),
       accept: (I, src) => judge(I, src),
-      solve: (I) => I.ref,
+      solve: (I) => JP(JSON.parse(I.ref)),
       bad: (I) => I.bads,
       hint: (I) => I.lv === 1 ? "Aggregations need doc values. Dynamic mapping gave every string a .keyword sub-field. And which products count?" : I.lv === 2 ? "date_histogram buckets are cut in UTC unless you pass time_zone." : "Distinct customers is a cardinality aggregation (on a keyword field), nested under the date_histogram next to a sum.",
       concept: "Aggregations on doc values",

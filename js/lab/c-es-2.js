@@ -1049,6 +1049,505 @@
     why: (I) => I.lv === 1 ? "Both workers read the same stock and each wrote its own result, so one sale vanished: a classic lost update." : I.lv === 2 ? "The 409 fired correctly, but resending the stale body with the new _seq_no overwrote the other worker's change. On conflict, recompute from a fresh read." : "Once the 60 s tombstone was purged, the late v105 write found no document and no tombstone, so it was accepted and the deleted product reappeared.",
   });
 
+
+  /* ---------- Steps helper: a pool of steps (with traps); graded by required steps, forbidden steps and order rules ---------- */
+  // I: { opts:[{id,t}], need:[ids], forbid:{id: reason}, before:[[a, b, reason]], ref:[ids], alt?: {id: [ids it may replace]} }
+  function stepsJudge(I, a) {
+    const ids = a.map((i) => I.opts[i].id);
+    for (const id of ids) if (I.forbid[id]) return `<b>${esc(I.opts.find((o) => o.id === id).t)}</b>: ${I.forbid[id]}`;
+    const has = (id) => ids.includes(id) || (I.alt && Object.entries(I.alt).some(([k, v]) => v.includes(id) && ids.includes(k)));
+    const miss = I.need.filter((id) => !has(id));
+    if (miss.length) return `Missing a step: <b>${esc(I.opts.find((o) => o.id === miss[0]).t)}</b>${I.why && I.why[miss[0]] ? ` (${I.why[miss[0]]})` : ""}.`;
+    const pos = (id) => { let p = ids.indexOf(id); if (p < 0 && I.alt) Object.entries(I.alt).forEach(([k, v]) => { if (v.includes(id) && ids.includes(k)) p = ids.indexOf(k); }); return p; };
+    for (const [x, y, why] of I.before) { const px = pos(x), py = pos(y); if (px >= 0 && py >= 0 && px > py) return `Order: ${why}`; }
+    return true;
+  }
+  function stepsSc(d) {
+    return {
+      w: "steps",
+      ...d,
+      gen(lv, R) { const I = d.make(lv, R); I.opts = R.shuffle(I.pool.map(([id, t]) => ({ id, t }))); delete I.pool; return I; },
+      ui: (I) => ({ opts: I.opts.map((o) => o.t), html: true }),
+      accept: (I, a) => stepsJudge(I, a),
+      solve: (I) => I.ref.map((id) => I.opts.findIndex((o) => o.id === id)),
+      bad: (I) => { const ix = (ids) => ids.map((id) => I.opts.findIndex((o) => o.id === id)); const out = [ix(I.ref.slice(0, -1)), ix(I.ref.slice().reverse())]; Object.keys(I.forbid).slice(0, 2).forEach((f) => out.push(ix([...I.ref.slice(0, 1), f, ...I.ref.slice(1)]))); return out; },
+    };
+  }
+  const c = (s) => `<code>${esc(s)}</code>`;
+
+  /* ---------- P1. Zero-downtime reindex with aliases ---------- */
+  MORE.push(stepsSc({
+    id: "es-reindex-alias",
+    name: "Zero-downtime reindex behind an alias",
+    kind: "Change plan",
+    skills: ["safe", "design"],
+    make(lv, R) {
+      const f = R.pick(["brand", "category", "color"]);
+      const pool = [
+        ["create", `${c("PUT products-v2")} with the new mapping (${esc(f)} as keyword)`],
+        ["reindex", `${c("POST _reindex")} from products-v1 into products-v2`],
+        ["verify", `Compare ${c("GET products-v1/_count")} with products-v2 and run the smoke-test queries on products-v2`],
+        ["swap", `${c("POST _aliases")} with remove products-v1 + add products-v2 for alias ${c("products")}, in one request`],
+        ["putmap", `${c("PUT products-v1/_mapping")} changing ${esc(f)} from text to keyword`],
+        ["twocalls", `Remove alias ${c("products")} from products-v1, then add it to products-v2 (two requests)`],
+        ["delfirst", `${c("DELETE products-v1")} first so the name is free, then create the alias`],
+        ["close", `${c("POST products-v1/_close")} so nothing changes during the copy`],
+      ];
+      const I = { lv, f, pool, forbid: { putmap: `the type of an existing field can't be changed in place (mapper [${f}] cannot be changed from type [text] to [keyword]); that's why you reindex`, twocalls: "between the two requests the alias points nowhere and every search fails with index_not_found; alias actions in one _aliases call are atomic", delfirst: "you'd delete the source of the copy and leave search with no index at all", close: "a closed index can't be read: search is down for the whole copy" }, before: [["create", "reindex", "the target must exist with the new mapping before the copy (otherwise dynamic mapping creates it with the old guesses)"], ["reindex", "verify", "verify after the copy"], ["verify", "swap", "switch the alias only after verifying"]], need: ["create", "reindex", "verify", "swap"], ref: ["create", "reindex", "verify", "swap"], why: {} };
+      if (lv >= 2) {
+        pool.push(["write", `Move the write alias ${c("products-write")} to products-v2 (${c('"is_write_index": true')})`], ["reindexc", `${c("POST _reindex")} with ${c('"dest": {"op_type": "create"}')} and ${c('"conflicts": "proceed"')}`]);
+        I.forbid.reindex = "with writes going to products-v2 first, a plain reindex overwrites documents updated there with their stale v1 copies; without the write switch, updates made during the copy are lost";
+        I.need = ["create", "write", "reindexc", "verify", "swap"];
+        I.before = [["create", "write", "the target must exist first"], ["write", "reindexc", "switch writes to v2 before the copy starts, or updates made during the copy are lost"], ["reindexc", "verify", "verify after the copy"], ["verify", "swap", "switch reads only after verifying"]];
+        I.ref = ["create", "write", "reindexc", "verify", "swap"];
+      }
+      if (lv === 3) {
+        pool.push(["tune", `${c("PUT products-v2/_settings")} ${c('{"refresh_interval": "-1", "number_of_replicas": 0}')}`], ["restore", `Restore ${c('refresh_interval: "1s"')} and ${c("number_of_replicas: 1")} on products-v2, then wait for green`], ["dropold", `${c("DELETE products-v1")} right after switching reads`]);
+        I.forbid.dropold = "keep products-v1 for a few days: switching the alias back is your instant rollback if the new mapping misbehaves in production";
+        I.need = ["create", "tune", "write", "reindexc", "restore", "verify", "swap"];
+        I.before.push(["tune", "reindexc", "tune the target before the copy"], ["reindexc", "restore", "restore settings after the copy"], ["restore", "swap", "don't serve production reads from an index with no replicas and no refresh: restore and wait for green first"]);
+        I.ref = ["create", "tune", "write", "reindexc", "restore", "verify", "swap"];
+        I.why = { tune: "the 9-hour copy only fits the window with refresh off and no replicas during the load", restore: "products-v2 would serve reads with no replica and no refresh" };
+      }
+      return I;
+    },
+    text: (I) => `<p>Search reads from the alias ${c("products")} (→ products-v1). You need <code>${esc(I.f)}</code> as a keyword field, which means a new index. ${I.lv === 1 ? "The catalog is rebuilt nightly and nothing writes to it during the day." : `The app keeps writing through the alias ${c("products-write")} (→ products-v1) the whole time, and price/stock updates must not be lost.`}${I.lv === 3 ? " The copy takes 9 hours at default settings and must fit in a 4-hour window." : ""}</p><p>Build the plan from the steps below (some are traps).</p>`,
+    hint: (I) => I.lv === 1 ? "Mappings can't change a field's type in place. Aliases can be switched atomically." : I.lv === 2 ? "If writes keep going to v1 during the copy, the copy misses them. If writes go to v2, the copy must not overwrite newer documents." : "Bulk-load settings speed up the copy, but they must be undone before the index serves traffic. And keep a way back.",
+    concept: "Reindexing behind aliases",
+    how: "A field's type can't be changed in an existing index, so mapping changes mean creating a new index and copying with <code>_reindex</code>. Applications should only ever talk to aliases: one <code>POST _aliases</code> request with remove + add actions switches atomically, so no request sees a missing or half-filled index. With live writes, point the write alias (<code>is_write_index</code>) at the new index first, then reindex with <code>op_type: create</code> and <code>conflicts: proceed</code> so the copy fills gaps without overwriting newer documents. Turn refresh off and replicas to 0 for the bulk copy, restore them and wait for green before switching reads, and keep the old index until you're sure.",
+    rule: "Always read and write through aliases, switch them atomically in one _aliases call, and keep the old index until the new one has served production for a while.",
+    why: (I) => I.lv === 1 ? "Create → reindex → verify → atomic alias swap: search never sees a missing or empty index." : I.lv === 2 ? "Moving the write alias first and reindexing with op_type: create means every update made during the copy lands in v2 and the copy never overwrites it." : "The tuned copy fits the window; restoring replicas and refresh (and waiting for green) before the read switch keeps production safe; v1 stays as the rollback.",
+  }));
+
+  /* ---------- P2. Deep pagination / export ---------- */
+  MORE.push(stepsSc({
+    id: "es-deep-pagination",
+    name: "Export 40 million documents",
+    kind: "Design review",
+    skills: ["design"],
+    make(lv, R) {
+      const n = R.pick([30, 40, 60]);
+      const pool = [
+        ["open", `${c("POST orders/_pit?keep_alive=1m")} to open a point in time`],
+        ["first", `${c("GET _search")} with ${c('{"size": 10000, "pit": {"id": <pit>, "keep_alive": "1m"}, "sort": [{"created_at": "asc"}]}')}`],
+        ["next", `Repeat with ${c("search_after")} = the last hit's ${c("sort")} values and the latest PIT id, until a page is empty`],
+        ["close", `${c("DELETE _pit")} with the PIT id`],
+        ["fromsize", `Page with ${c("from")} = 10000, 20000, 30000, … and ${c("size")} = 10000`],
+        ["window", `${c("PUT orders/_settings")} ${c(`{"index.max_result_window": ${n}000000}`)}`],
+      ];
+      const I = { lv, n, pool, need: ["open", "first", "next", "close"], ref: ["open", "first", "next", "close"], forbid: { fromsize: "from + size above index.max_result_window (10,000) is rejected, and below it every page still makes each shard collect from + size hits", window: "each page would make every shard sort and hold from + size hits in memory: deep from/size pagination gets slower per page and can take nodes down" }, before: [["open", "first", "open the PIT first"], ["first", "next", "the first page provides the sort values for search_after"], ["next", "close", "close the PIT when the export is done"]], why: {} };
+      if (lv >= 2) { pool.push(["nopit", `Skip the PIT: ${c("search_after")} on ${c("created_at")} against the live index`], ["scroll", `${c("POST orders/_search?scroll=24h")} once and keep scrolling`]); I.forbid.nopit = "without a point in time, writes and refreshes during the export shift pages, and documents with the same created_at millisecond get skipped or repeated (no unique tiebreaker)"; I.forbid.scroll = "a 24-hour scroll pins a search context and its segments for a day; scroll is no longer recommended for deep pagination, PIT + search_after is"; }
+      if (lv === 3) { pool.push(["slice", `Run 4 workers, each adding ${c('"slice": {"id": i, "max": 4}')} to the same PIT search`], ["longka", `Open the PIT with ${c("keep_alive=24h")} once so it never expires`]); I.forbid.longka = "keep_alive only needs to cover the gap until the next request (it's renewed on each one); a 24h PIT keeps merged-away segments on disk for a day"; I.need = ["open", "slice", "first", "next", "close"]; I.ref = ["open", "slice", "first", "next", "close"]; I.before.push(["open", "slice", "all slices share one PIT"], ["slice", "first", "each worker's first request already carries its slice"]); I.why = { slice: `one sequential reader can't move ${n}M documents within the 1-hour window` }; }
+      return I;
+    },
+    text: (I) => `<p>A nightly job exports all <b>${I.n} million</b> documents of <code>orders</code> to the data lake, ordered by <code>created_at</code>.${I.lv >= 2 ? " Orders keep being written and updated during the export, and the export must be a consistent snapshot." : ""}${I.lv === 3 ? " It must finish within an hour; one reader manages about 15M documents per hour." : ""} The current job uses <code>from</code>/<code>size</code> and fails at page 2 with <i>Result window is too large</i>.</p><p>Build the export loop from the steps below (some are traps).</p>`,
+    hint: (I) => I.lv === 1 ? "Deep pagination should continue from where the last page ended, not skip N hits." : I.lv === 2 ? "A point in time freezes the view of the index, and searches with a PIT get an implicit _shard_doc tiebreaker." : "A PIT can be read in parallel with sliced searches; keep_alive is renewed with every request.",
+    concept: "Deep pagination: PIT + search_after",
+    how: "<code>from</code>/<code>size</code> makes every shard collect and sort <code>from + size</code> hits, so cost grows with depth and requests beyond <code>index.max_result_window</code> (10,000) are rejected. <code>search_after</code> continues from the sort values of the last hit, so every page costs the same. A point in time (<code>POST index/_pit</code>) freezes a view of the index so concurrent writes don't shift pages, and PIT searches get an implicit <code>_shard_doc</code> tiebreaker so equal sort values never skip or repeat documents. <code>keep_alive</code> only needs to last until the next request; <code>slice</code> splits a PIT for parallel readers. Close the PIT when done.",
+    rule: "For anything beyond the first pages or for exports, use PIT + search_after with a short, renewed keep_alive; never raise max_result_window to make from/size work.",
+    why: (I) => I.lv === 1 ? "PIT + search_after reads every page at the same cost and isn't limited by max_result_window." : I.lv === 2 ? "The PIT keeps the export consistent while orders change, and its implicit tiebreaker prevents duplicates and gaps at equal created_at values." : `Four slices of one PIT read ${I.n}M documents in parallel within the hour; a 1-minute keep_alive renewed per request avoids pinning segments for a day.`,
+  }));
+
+  /* ---------- P3. Rolling restart ---------- */
+  MORE.push(stepsSc({
+    id: "es-rolling-restart",
+    name: "Rolling restart without a red minute",
+    kind: "Change plan",
+    skills: ["safe"],
+    make(lv, R) {
+      const v = R.pick(["8.18.4", "8.19.2", "9.0.6"]);
+      const pool = [
+        ["disable", `${c("PUT _cluster/settings")} ${c('{"persistent": {"cluster.routing.allocation.enable": "primaries"}}')}`],
+        ["stop", "Stop Elasticsearch on the node and install the patch"],
+        ["start", `Start the node and wait for it to rejoin (${c("GET _cat/nodes")})`],
+        ["enable", `${c("PUT _cluster/settings")} ${c('{"persistent": {"cluster.routing.allocation.enable": null}}')}`],
+        ["green", `Wait for ${c("GET _cluster/health?wait_for_status=green")}`],
+        ["repeat", "Repeat for the next node"],
+        ["rep0", `Set ${c("number_of_replicas: 0")} on all indices first to make restarts faster`],
+        ["all", "Restart all nodes at once to get it over with"],
+        ["yellow", "Move on to the next node as soon as health is yellow"],
+      ];
+      const I = { lv, v, pool, need: ["disable", "stop", "start", "enable", "green", "repeat"], ref: ["disable", "stop", "start", "enable", "green", "repeat"], forbid: { rep0: "with no replicas, every restarting node takes its shards' only copy offline: the cluster goes red each time", all: "restarting every node at once is a full outage, not a rolling restart", yellow: "yellow means some replicas are still recovering; taking the next node down can take the last copy of a shard offline (red)" }, before: [["disable", "stop", "disable replica allocation before stopping the node, or the cluster starts rebuilding its replicas elsewhere"], ["stop", "start", "stop before start"], ["start", "enable", "re-enable allocation after the node is back so its local copies are reused"], ["enable", "green", "the replicas only recover once allocation is enabled again"], ["green", "repeat", "wait for green before the next node"]], why: {} };
+      if (lv >= 2) { pool.push(["tiers", "Start with the warm and cold data nodes, then the hot nodes"], ["masterslast", "Do the dedicated master-eligible nodes last"], ["mastersfirst", "Do the dedicated master-eligible nodes first"]); I.forbid.mastersfirst = "upgraded master nodes may publish cluster state that older nodes can't apply; upgrade data nodes first and masters last"; I.need = ["tiers", ...I.need, "masterslast"]; I.ref = ["tiers", ...I.ref, "masterslast"]; I.before.push(["tiers", "disable", "decide the node order before starting"], ["repeat", "masterslast", "masters come last"]); I.why = { tiers: "the upgrade guide goes tier by tier, hot nodes after the others", masterslast: "master-eligible nodes go last in an upgrade" }; }
+      if (lv === 3) { pool.push(["none", `Use ${c('"cluster.routing.allocation.enable": "none"')} instead of primaries`], ["delayed", `Skip disabling allocation and rely on ${c("index.unassigned.node_left.delayed_timeout")} (default 1m)`]); I.forbid.none = "\"none\" also blocks primaries of newly created indices: tonight's ILM rollover would create a red index during the restart"; I.forbid.delayed = "the patch takes ~10 minutes per node; after the 1-minute delay the cluster starts copying every replica of that node elsewhere, then throws the copies away when it returns"; }
+      return I;
+    },
+    text: (I) => `<p>Apply a security patch (Elasticsearch ${esc(I.v)}) to a production cluster one node at a time${I.lv >= 2 ? " (hot and warm data tiers plus three dedicated master-eligible nodes)" : ""}, with no red health and no unnecessary shard copying.${I.lv === 3 ? " ILM rolls over the logging data streams at midnight, during the window; each node takes about 10 minutes to patch." : ""} Build the per-node procedure from the steps (some are traps).</p>`,
+    hint: (I) => I.lv === 1 ? "Stop the cluster from rebuilding replicas while a node is briefly away, and bring it back before the next one goes." : I.lv === 2 ? "Order matters across node types too: newer masters, older data nodes is the safe direction." : "Compare what 'primaries' and 'none' block, and how long delayed allocation waits.",
+    concept: "Rolling restarts and upgrades",
+    how: "When a node leaves, its replicas are rebuilt elsewhere after <code>index.unassigned.node_left.delayed_timeout</code> (1 minute). For planned restarts, set <code>cluster.routing.allocation.enable: primaries</code> first so replicas aren't moved while still allowing new indices' primaries, stop and patch the node, start it, re-enable allocation so it reuses its local copies, and wait for green before the next node, since yellow means some shard has only one active copy. Upgrades go data tier by tier (frozen, cold, warm, then hot) and master-eligible nodes last.",
+    rule: "One node at a time: allocation to primaries, restart, allocation back to null, wait for green. Masters last.",
+    why: (I) => I.lv === 1 ? "Disabling replica allocation avoids a pointless copy storm; waiting for green guarantees every shard has its replica before the next node goes." : I.lv === 2 ? "Data tiers first and masters last keeps every node able to apply the cluster state published by the masters." : "\"primaries\" still allows the midnight rollover's new primaries, and disabling allocation (rather than relying on the 1-minute delay) avoids re-copying a node's replicas on every 10-minute patch.",
+  }));
+
+  /* ---------- L1. Slow log triage ---------- */
+  const slow = (t, node, idx, sh, ms, hits, src) => `[2026-07-15T${t}][WARN ][i.s.s.query] [${node}] [${idx}][${sh}] took[${ms >= 1000 ? (ms / 1000).toFixed(1) + "s" : ms + "ms"}], took_millis[${ms}], total_hits[${hits} hits], search_type[QUERY_THEN_FETCH], total_shards[6], source[${src}]`;
+  MORE.push({
+    id: "es-slow-log",
+    name: "Triage the search slow log",
+    kind: "Investigation",
+    skills: ["diagnose"],
+    w: "lines",
+    gen(lv, R) {
+      const q = R.pick(["phone", "cable", "case"]);
+      const normal = [
+        () => [`{"query":{"match":{"name":{"query":"${R.pick(["usb c hub", "desk lamp", "monitor arm"])}"}}},"size":20}`, R.int(510, 700)],
+        () => [`{"query":{"bool":{"filter":[{"term":{"brand":"${R.pick(["acme", "volt"])}"}},{"range":{"price":{"lte":${R.int(5, 20) * 10}}}}]}},"size":20}`, R.int(505, 640)],
+        () => [`{"size":0,"aggs":{"brands":{"terms":{"field":"brand","size":10}}}}`, R.int(520, 800)],
+      ];
+      const bad = [
+        [`{"query":{"wildcard":{"name":{"value":"*${q}*"}}},"size":50}`, R.int(8000, 12000), "wild"],
+        [`{"query":{"bool":{"filter":{"script":{"script":"doc['price'].value * doc['stock'].value > 1000"}}}},"size":50}`, R.int(5000, 7000), "script"],
+        [`{"query":{"match_all":{}},"from":${R.pick([9800, 9900])},"size":100,"sort":["price"]}`, R.int(3000, 4500), "deep"],
+        [`{"size":0,"aggs":{"sessions":{"terms":{"field":"session_id","size":${R.pick([50000, 100000])}}}}}`, R.int(6000, 9000), "aggs"],
+      ];
+      const herring = [`{"size":5000,"sort":["_doc"],"query":{"range":{"updated_at":{"gte":"now-1d/d"}}}}`, R.int(2500, 4000)];
+      const culprits = lv === 1 ? [bad[0]] : lv === 2 ? [bad[0], bad[1]] : [bad[2], bad[3]];
+      const rows = [];
+      for (let i = 0; i < 6; i++) { const [src, ms] = R.pick(normal)(); rows.push({ src, ms, bad: false }); }
+      culprits.forEach((c2) => { rows.push({ src: c2[0], ms: c2[1], bad: true }); if (lv > 1) rows.push({ src: c2[0], ms: c2[1] - R.int(200, 900), bad: true, dup: true }); });
+      if (lv >= 2) rows.push({ src: herring[0], ms: herring[1], bad: false, at: "02:1" + R.int(0, 9) });
+      const sh = R.shuffle(rows);
+      const nodes = ["es-data-1", "es-data-2", "es-data-3"];
+      const lines = sh.map((r, i) => ({ t: slow(r.at ? `${r.at}:${String(R.int(10, 59))},${R.int(100, 999)}` : `10:0${Math.floor(i / 2)}:${String(10 + i * 4).slice(0, 2)},${R.int(100, 999)}`, R.pick(nodes), r.src.includes("session") ? "logs-web" : "products", R.int(0, 5), r.ms, R.int(10, 5000), r.src), k: " " }));
+      const ans = sh.map((r, i) => (r.bad && !r.dup ? i : -1)).filter((i) => i >= 0);
+      const ansAll = sh.map((r, i) => (r.bad ? i : -1)).filter((i) => i >= 0);
+      return { lv, lines, ans: lv === 1 ? ans : ansAll, k: lv === 1 ? 1 : ansAll.length };
+    },
+    text: (I) => `<p>Search CPU spiked to 90% on all data nodes at 10:00 and p99 tripled. The search slow log (warn threshold 500 ms, per shard) shows the entries below. Flag ${I.lv === 1 ? "the entry" : `the <b>${I.k}</b> entries`} that come from the request pattern${I.lv === 1 ? "" : "s"} causing the spike.${I.lv === 2 ? " (The nightly export runs at 02:00.)" : ""}</p>`,
+    ui: (I) => ({ lines: I.lines, k: I.k, file: "elasticsearch_index_search_slowlog.log" }),
+    ans: (I) => I.ans,
+    diag: () => "Not quite. Look at the query shapes, not only at took: which patterns are expensive on every shard, and which slow entries are expected?",
+    hint: (I) => I.lv === 1 ? "A wildcard with a leading * can't use the term dictionary's ordering: it scans every term." : I.lv === 2 ? "Script queries run per document. A long scroll-like export sorted by _doc at 02:00 isn't today's 10:00 problem." : "Deep from/size makes every shard collect from + size hits; a terms aggregation with a huge size builds that many buckets per shard.",
+    concept: "Reading the search slow log",
+    how: "The search slow log records, per shard, query and fetch phases that exceed thresholds (<code>index.search.slowlog.threshold.query.warn</code> etc.), with the request source. Because it's per shard, one bad request appears once per shard it touched. Look for expensive shapes: leading wildcards and regexps (scan the whole term dictionary), script queries (run per document), deep <code>from</code> (each shard sorts from + size hits) and huge terms aggregations, and separate them from expected slow work such as exports sorted by <code>_doc</code>. The <code>X-Opaque-Id</code> header lets you attribute entries to a client.",
+    rule: "Enable the slow log with sane thresholds on busy indices, have clients send X-Opaque-Id, and triage by query shape and timing, not just by the largest took value.",
+    why: (I) => I.lv === 1 ? "The leading-wildcard query took seconds per shard; everything else was ordinary." : I.lv === 2 ? "The leading wildcard and the per-document script query appear on several shards around 10:00; the 02:00 export is slow but cheap and expected." : "Deep pagination (from ≈ 9,900) and a terms aggregation with tens of thousands of buckets ran on every shard; both entries appear once per shard.",
+  });
+
+  /* ---------- L2. Client code review ---------- */
+  MORE.push({
+    id: "es-client-review",
+    name: "Review the indexing client",
+    kind: "Code review",
+    skills: ["diagnose", "safe"],
+    w: "lines",
+    gen(lv, R) {
+      const idx = R.pick(["products", "listings", "catalog"]);
+      let L;
+      if (lv === 1) L = [["@", "@@ def save_product(es, product):"], ["+", `    es.index(index="${idx}", id=product["id"], document=product, refresh=True)`, 1], ["+", '    metrics.incr("products.indexed")'], ["@", "@@ def search_products(es, q, page):"], ["+", `    return es.search(index="${idx}", query={"match": {"name": q}}, from_=page * 20, size=20)`], ["@", "@@ def export_all(es):"], ["+", "    page = 0"], ["+", "    while True:"], ["+", `        resp = es.search(index="${idx}", query={"match_all": {}}, from_=page * 1000, size=1000)`, 1], ["+", '        if not resp["hits"]["hits"]:'], ["+", "            break"], ["+", '        write_rows(resp["hits"]["hits"])'], ["+", "        page += 1"]];
+      else if (lv === 2) L = [["@", "@@ def index_batch(es, orders):"], ["+", "    ops = []"], ["+", "    for o in orders:"], ["+", `        ops.append({"index": {"_index": "orders", "_id": o["id"]}})`], ["+", "        ops.append(o)"], ["+", "    try:"], ["+", "        resp = es.bulk(operations=ops)"], ["+", '        log.info("indexed batch of %d", len(orders))', 1], ["+", "    except ApiError as e:"], ["+", "        if e.status_code == 429:"], ["+", "            return index_batch(es, orders)", 1], ["+", "        raise"]];
+      else L = [["@", "@@ def migrate(es, old, new):"], ["+", `    es.indices.create(index=new, mappings=MAPPING, settings={"number_of_replicas": 0, "refresh_interval": "-1"})`], ["+", `    es.reindex(source={"index": old}, dest={"index": new}, wait_for_completion=False)`, 1], ["+", `    es.indices.put_settings(index=new, settings={"number_of_replicas": 1, "refresh_interval": "1s"})`], ["+", `    es.indices.delete_alias(index=old, name="${idx}")`, 1], ["+", `    es.indices.put_alias(index=new, name="${idx}")`], ["+", "    es.indices.delete(index=old)", 1], ["+", '    log.info("migration done")']];
+      const lines = L.map(([k, t]) => ({ k, t }));
+      const ans = L.map((x, i) => (x[2] ? i : -1)).filter((i) => i >= 0);
+      return { lv, idx, lines, ans };
+    },
+    text: (I) => `<p>Review this ${I.lv === 1 ? "catalog service" : I.lv === 2 ? "order indexer (Python client, 8.x)" : "migration script, which will run against production tonight"} diff. Flag the <b>${I.ans.length}</b> lines that will cause trouble in production.</p>`,
+    ui: (I) => ({ lines: I.lines, k: I.ans.length, file: I.lv === 3 ? "scripts/migrate_index.py" : "app/search_index.py" }),
+    ans: (I) => I.ans,
+    diag: () => "Not quite. Think about what each call does under production load, on failure and at scale.",
+    hint: (I) => I.lv === 1 ? "What does refresh=True do on every single write? What happens at from = 10,000?" : I.lv === 2 ? "A bulk request returns 200 even when items fail. And what does an immediate retry do to an overloaded cluster?" : "What happens between the reindex call returning and the copy finishing? And between the two alias calls?",
+    concept: "Client-side Elasticsearch pitfalls",
+    how: "<code>refresh=True</code> on every write forces a new segment per request (use the default, or <code>wait_for</code> when read-your-write matters). <code>from</code>/<code>size</code> fails beyond 10,000 hits, so exports need PIT + search_after. The bulk API returns HTTP 200 with <code>errors: true</code> and per-item statuses, so you must inspect items and retry only the failed ones (429s with exponential backoff, as the client's bulk helpers do). <code>_reindex</code> with <code>wait_for_completion=false</code> returns a task id immediately: you must poll <code>_tasks</code> before switching. Alias changes should be one atomic <code>update_aliases</code> call, and deleting the old index removes your rollback.",
+    rule: "Never refresh per write, always check bulk item errors and back off on 429, and make migrations wait for tasks and switch aliases atomically.",
+    why: (I) => I.lv === 1 ? "refresh=True per document creates a segment per write (merge storms, slow indexing); the export loop dies at from = 10,000." : I.lv === 2 ? "Failed bulk items are silently logged as indexed; the 429 handler retries instantly and recursively with the whole batch, hammering an overloaded cluster." : "The reindex returns before copying anything, so the alias moves to a nearly empty index; the two alias calls leave a window with no alias; deleting the old index removes the rollback.",
+  });
+
+  /* ---------- C1. Field types ---------- */
+  MORE.push({
+    id: "es-field-types",
+    name: "Pick the field types",
+    kind: "Design review",
+    skills: ["design"],
+    w: "classify",
+    gen(lv, R) {
+      const pools = {
+        1: [["title: product name, full-text searched in the search box", 0], ["sku: e.g. AB-1234-X, exact lookups only", 1], ["price: range filters and sorting", 3], ["created_at: date range filters", 4], ["brand: searched as text and used as a facet", 2], ["description: long marketing text, searched, never aggregated", 0], ["color: facet and exact filter", 1]],
+        2: [["order_id: numeric-looking id like 99182731, only looked up by exact value", 1], ["zip_code: e.g. 02139, exact filter", 1], ["http_status: filtered with >= 500 and < 600", 3], ["user_agent: grouped by exact string in a top-N table", 1], ["product_name: search box and an A–Z sort", 2], ["quantity: summed in revenue reports", 3], ["shipped_at: per-day histogram", 4]],
+        3: [["message: application log line, full-text searched, never scored or sorted", 3], ["labels: arbitrary key/value pairs from Kubernetes", 4], ["url.original: searched with *substring* wildcards", 5], ["trace_id: exact lookups", 1], ["error.stack: searched with phrases, relevance matters", 0], ["bytes: summed and averaged", 2], ["service.name: filters and facets", 1]],
+      };
+      const cats = lv === 3 ? ["text", "keyword", "numeric", "match_only_text", "flattened", "wildcard"] : ["text", "keyword", "text + keyword sub-field", "numeric", "date"];
+      const items = R.shuffle(pools[lv]);
+      return { lv, items: items.map((x) => x[0]), cats, ans: items.map((x) => x[1]) };
+    },
+    text: (I) => `<p>You're writing the mapping for a new ${I.lv === 3 ? "log" : I.lv === 2 ? "orders" : "product"} index. For each field, pick the type that serves how it's used${I.lv === 3 ? " at the lowest cost" : ""}.</p>`,
+    ui: (I) => ({ items: I.items, cats: I.cats }),
+    ans: (I) => I.ans,
+    diag: (I, a) => { const w = a.findIndex((x, i) => x !== I.ans[i]); return `Check <b>${esc(I.items[w].split(":")[0])}</b>.`; },
+    hint: (I) => I.lv === 1 ? "text for words, keyword for exact values and facets, numbers and dates for ranges, both (multi-field) when a value is searched and aggregated." : I.lv === 2 ? "Identifiers that are only matched exactly are faster as keyword than as numbers, and numbers drop leading zeros." : "Logs: match_only_text drops scoring data, flattened handles arbitrary keys, wildcard handles substring search on long values.",
+    concept: "Choosing field types",
+    how: "<code>text</code> is analysed for relevance-ranked search; <code>keyword</code> keeps exact values for filters, sorting and aggregations; a multi-field gives both. Numeric types use BKD trees optimised for ranges, so identifiers matched only by exact value (order ids, zip codes) are better as keyword, which is optimised for term lookups and keeps leading zeros. For logs, <code>match_only_text</code> skips positions and frequencies (smaller, no scoring), <code>flattened</code> maps an object with arbitrary keys as one field, and <code>wildcard</code> is built for substring/grep-like queries on long values.",
+    rule: "Map by usage: words → text, exact/facets → keyword, ranges/sums → numeric or date; ids are keywords; pick match_only_text, flattened and wildcard for log-shaped data.",
+    why: (I) => `Reference: ${I.items.map((t, k) => `${esc(t.split(":")[0])} → ${esc(I.cats[I.ans[k]])}`).join("; ")}.`,
+  });
+
+  /* ---------- C2. Dynamic mapping surprises (computed by the simulator) ---------- */
+  const DYN_CATS = ["indexed as sent", "indexed, value changed", "rejected"];
+  function dynOutcome(docs) {
+    const es = ES(), idx = es.createIndex({});
+    return docs.map((d) => {
+      try {
+        es.indexDoc(idx, "x", d);
+        let changed = false;
+        Object.entries(d).forEach(([k, v]) => { const f = idx.fields.get(k); if (!f) return; if (["long", "integer"].includes(f.type) && ((typeof v === "number" && !Number.isInteger(v)) || (typeof v === "string" && String(Math.trunc(Number(v))) !== v))) changed = true; });
+        return changed ? 1 : 0;
+      } catch (e) { if (e instanceof es.ESErr) return 2; throw e; }
+    });
+  }
+  MORE.push({
+    id: "es-dynamic-mapping",
+    name: "What dynamic mapping does to your data",
+    kind: "Investigation",
+    skills: ["diagnose", "design"],
+    w: "classify",
+    gen(lv, R) {
+      let docs;
+      const p = R.int(10, 40);
+      if (lv === 1) docs = [{ sku: "A-1", price: p, in_stock: true }, { sku: "A-2", price: p + 0.99, in_stock: true }, { sku: "A-3", price: "free", in_stock: false }, { sku: "A-4", price: p + 5, in_stock: "yes" }, { sku: "A-5", price: p + 2, in_stock: false, tags: ["new", "sale"] }];
+      else if (lv === 2) docs = [{ user: "bob", created: "2026-07-01", amount: p }, { user: "eve", created: "07/02/2026", amount: p + 3 }, { user: { id: 7, name: "carol" }, created: "2026-07-03", amount: p + 1 }, { user: "dan", created: "2026-07-04T10:00:00Z", amount: "42" }, { user: "fay", created: "2026-07-05", amount: p }];
+      else docs = [{ zip: 2139, score: 0, ref: "x-1" }, { zip: "02139", score: 0.5, ref: "x-2" }, { zip: 10001, score: 3, ref: 42 }, { zip: "SW1A", score: 1, ref: "x-4" }, { zip: 94105, score: "0.75", ref: "x-5" }];
+      docs = docs.slice(0, 1).concat(R.shuffle(docs.slice(1)));
+      return { lv, docs, ans: dynOutcome(docs), items: docs.map((d) => J(d)) };
+    },
+    text: (I) => `<p>These documents are indexed <b>in this order</b> into a brand-new index with no mapping (dynamic mapping, default settings). For each, say what happens. The first document decides each field's type.</p>`,
+    ui: (I) => ({ items: I.items, cats: DYN_CATS }),
+    ans: (I) => I.ans,
+    diag: (I, a) => { const w = a.findIndex((x, i) => x !== I.ans[i]); return `Check document ${w + 1}: <code>${esc(I.items[w])}</code>.`; },
+    hint: (I) => I.lv === 1 ? "A whole number maps to long; later decimals are accepted but truncated in the index (coerce). Strings that aren't numbers or booleans are rejected." : I.lv === 2 ? "Date detection only recognises the default formats. A field mapped as text can't later receive an object." : "zip and score are decided by their first values. Strings that look like numbers are coerced into numeric fields; anything else is rejected. Numbers sent to a text field are fine.",
+    concept: "Dynamic mapping and coercion",
+    how: "With dynamic mapping, the first value of a new field decides its type for the life of the index: a whole number becomes <code>long</code>, a decimal <code>float</code>, true/false <code>boolean</code>, a string matching the default date formats <code>date</code>, other strings <code>text</code> + <code>.keyword</code>. Later values are coerced if possible: 10.99 or \"10.99\" into a long is indexed as 10 (the _source still shows 10.99, which makes the bug hard to see), \"02139\" becomes 2139. Values that can't be converted (\"free\" into a long, \"yes\" into a boolean, an object into a text field) reject the whole document with a mapper or document parsing exception. Numeric detection is off by default, so \"42\" in a text field stays a string.",
+    rule: "Map important fields explicitly before the first document arrives, and consider coerce: false or dynamic: strict so bad data fails loudly instead of being silently truncated.",
+    why: (I) => I.items.map((d, k) => `${k + 1}: ${DYN_CATS[I.ans[k]]}`).join(" · "),
+  });
+
+  /* ---------- C3. Denormalise or not ---------- */
+  MORE.push({
+    id: "es-data-modeling",
+    name: "Model relationships without joins",
+    kind: "Design review",
+    skills: ["design"],
+    w: "classify",
+    gen(lv, R) {
+      const n = R.pick([20, 40, 60]);
+      const pools = {
+        1: [[`brand name and logo (brands are renamed about once a year; every query filters on brand)`, 0], [`variants: size + color + in-stock per variant, filtered as a combination ("red AND size 42 AND in stock")`, 1], [`live stock per warehouse, updated ~500 times a second`, 2], [`category path (e.g. Shoes > Running), changes rarely, used for facets`, 0]],
+        2: [[`seller display name (shown in results; changes a few times a year per seller; one seller has up to 2M products)`, 0], [`price history (365 points per product, only shown on the product page)`, 2], [`review text (millions of reviews, searched separately from products)`, 2], [`compatible models list for a part, e.g. "fits iPhone 15, 15 Pro" (strings, filtered individually)`, 0], [`bundle components: sku + quantity, queried as pairs`, 1]],
+        3: [[`Q&A answers: millions, added constantly, and search must find products whose answers mention a term`, 3], [`variants with per-variant price and stock, filtered together`, 1], [`marketing tags edited by merchandising a few times a day across ~50k products at once`, 0], [`per-store availability for 3,000 stores, updated every minute`, 2], [`brand country of origin (never changes), used as a filter`, 0]],
+      };
+      const items = R.shuffle(pools[lv]);
+      const cats = lv === 3 ? ["copy into the product doc", "nested field", "separate index, combine in the app", "join field (parent/child)"] : ["copy into the product doc", "nested field", "separate index, combine in the app"];
+      return { lv, n, items: items.map((x) => x[0]), cats, ans: items.map((x) => x[1]) };
+    },
+    text: (I) => `<p>The product search index holds <b>${I.n}M products</b>. Elasticsearch has no general joins, so each related piece of data has to be modelled for how it's queried and how often it changes. Choose a model for each.</p>`,
+    ui: (I) => ({ items: I.items, cats: I.cats }),
+    ans: (I) => I.ans,
+    diag: (I, a) => { const w = a.findIndex((x, i) => x !== I.ans[i]); return `Reconsider: <b>${esc(I.items[w].split("(")[0])}</b>. Weigh how it's queried against how often it changes and how many documents a change touches.`; },
+    hint: (I) => I.lv === 1 ? "Copying is cheap when the data rarely changes; fields that must match within the same sub-object need nested; data that changes constantly shouldn't force reindexing products." : I.lv === 2 ? "A list of plain strings doesn't need nested. Data shown only on a detail page doesn't need to be in the search index at all." : "Parent/child (join) lets children be added without reindexing the parent and supports has_child queries, at a query-time cost; it's for many, independently updated children.",
+    concept: "Denormalisation, nested, application joins and parent/child",
+    how: "Search engines are fastest when each document holds everything a query needs, so the default is to denormalise: copy brand or category names into every product and re-update the affected documents when they rarely change (update_by_query). Arrays of objects whose fields must match together need <code>nested</code>. Fast-changing data (stock, prices per store) belongs in its own small index or store, combined in the application, so that each change doesn't reindex a large product document. A <code>join</code> field (parent/child) lets many children be added independently and queried with <code>has_child</code>, but parents and children must share a shard and queries cost more.",
+    rule: "Denormalise what's read often and changes rarely, nest what must match together, keep high-churn data out of large documents, and reach for parent/child only for many independently updated children.",
+    why: (I) => `Reference: ${I.items.map((t, k) => `${esc(t.split(/[(:,]/)[0].trim())} → ${esc(I.cats[I.ans[k]])}`).join("; ")}.`,
+  });
+
+  /* ---------- O1. Reciprocal rank fusion ---------- */
+  MORE.push({
+    id: "es-rrf",
+    name: "Fuse lexical and vector results",
+    kind: "Estimate",
+    skills: ["estimate", "design"],
+    w: "order",
+    gen(lv, R) {
+      const names = R.shuffle(["trail runner gtx", "waterproof hiking boot", "rain jacket", "gore-tex sock", "summit boot", "approach shoe", "gaiter set", "trekking pole", "dry bag", "mesh trainer", "winter boot"]);
+      const k = lv === 3 ? 10 : 60, win = lv === 2 ? 3 : 5, depth = 5;
+      let lists, ranked, ok = false;
+      for (let t = 0; t < 300 && !ok; t++) {
+        lists = (lv >= 2 ? [0, 1, 2] : [0, 1]).map(() => R.sample(names.slice(0, 8), depth));
+        const score = {};
+        lists.forEach((l) => l.slice(0, win).forEach((d, i) => (score[d] = (score[d] || 0) + 1 / (k + i + 1))));
+        ranked = Object.entries(score).sort((a, b) => b[1] - a[1]);
+        ok = ranked.length >= 5;
+        for (let i = 0; ok && i < Math.min(5, ranked.length - 1); i++) if (Math.abs(ranked[i][1] - ranked[i + 1][1]) < 1e-12) ok = false;
+      }
+      if (!ok) return null;
+      const items = R.shuffle([...new Set(lists.flat())]);
+      return { lv, k, win, lists, labels: lv >= 2 ? ["BM25", "kNN (dense)", "ELSER (sparse)"] : ["BM25", "kNN"], items, top: ranked.slice(0, 5).map((x) => x[0]), scores: ranked.slice(0, 6) };
+    },
+    text: (I) => `<p>A hybrid search runs ${I.lists.length} retrievers and fuses them with an <code>rrf</code> retriever (<code>rank_constant: ${I.k}</code>, <code>rank_window_size: ${I.win}</code>). Each document's score is Σ 1 / (rank_constant + rank) over the lists where it appears within the window (rank starts at 1).</p>${K.table(["rank", ...I.labels], [0, 1, 2, 3, 4].map((r) => [String(r + 1), ...I.lists.map((l) => `<span class="${r >= I.win ? "muted" : ""}">${esc(l[r])}</span>`)]), { compact: true })}<p>Put the <b>fused top 5</b> in order.</p>`,
+    ui: (I) => ({ items: I.items, len: 5 }),
+    ans: (I) => I.top.map((d) => I.items.indexOf(d)),
+    diag: () => "Not that order. Compute each document's sum of 1/(k + rank) — only ranks within the window count.",
+    hint: (I) => I.lv === 1 ? "A document in both lists usually beats one ranked first in only one list." : I.lv === 2 ? "Ranks 4 and 5 are outside rank_window_size: they contribute nothing." : "A small rank_constant makes the top ranks count much more relative to appearing in several lists.",
+    concept: "Reciprocal rank fusion",
+    how: "Lexical (BM25) and vector (kNN, sparse) scores live on incomparable scales, so adding them lets one dominate. Reciprocal rank fusion ignores scores and uses ranks: score(d) = Σ 1 / (k + rank_i(d)) over each retriever's top <code>rank_window_size</code> results. Documents found by several retrievers rise; <code>rank_constant</code> k (60 by default) controls how much the very top ranks matter compared with agreement between lists. It needs no score normalisation or tuning, which is why it's a good default for hybrid search; a linear combination with normalised scores can beat it once you have judgments to tune weights.",
+    rule: "Start hybrid search with RRF (k = 60, a window of 50–100), and only move to weighted score blending when a judgment list shows it helps.",
+    why: (I) => `Fused scores: ${I.scores.slice(0, 5).map(([d, s]) => `${esc(d)} ${s.toFixed(4)}`).join(", ")}.`,
+  });
+
+  /* ---------- N1. Disk estimate ---------- */
+  MORE.push({
+    id: "es-disk-estimate",
+    name: "How much disk does the log cluster need?",
+    kind: "Estimate",
+    skills: ["estimate"],
+    w: "num",
+    gen(lv, R) {
+      const raw = R.pick([200, 300, 500]), ratio = R.pick([1.1, 1.3]), ret = R.pick([14, 30]), rep = 1, node = R.pick([4, 6, 8]);
+      const total = (raw * ratio * (1 + rep) * ret) / 0.85 / 1000;
+      if (lv === 1) return { lv, raw, ratio, ret, rep, total, truth: total };
+      if (lv === 2) return { lv, raw, ratio, ret, rep, node, total, truth: Math.ceil(total / node) + 1 };
+      const hotDays = R.pick([2, 3]), hotNode = R.pick([2, 3]);
+      const hot = (raw * ratio * (1 + rep) * hotDays) / 0.85 / 1000;
+      return { lv, raw, ratio, ret, rep, hotDays, hotNode, hot, truth: Math.ceil(hot / hotNode) + 1 };
+    },
+    text: (I) => `<p>Ingest is <b>${I.raw} GB/day</b> of raw logs; indexed, the data takes <b>${I.ratio}×</b> the raw size per copy. Retention is <b>${I.ret} days</b> with ${I.rep} replica. Keep disks below the <b>85%</b> low watermark.</p><p>${I.lv === 1 ? "How much total disk (in <b>TB</b>) does the cluster need?" : I.lv === 2 ? `Data nodes have <b>${I.node} TB</b> of disk each. How many data nodes do you need, including <b>one spare node's worth</b> of capacity so a node failure doesn't push the rest past the watermark?` : `Hot-warm: data stays on the hot tier for <b>${I.hotDays} days</b> (with its replica), then moves to warm. Hot nodes have <b>${I.hotNode} TB</b> each. How many <b>hot</b> nodes do you need, with one spare node's worth of capacity?`}</p>`,
+    ui: (I) => ({ unit: I.lv === 1 ? "TB" : "nodes" }),
+    accept: (I, a) => (I.lv === 1 ? LB.near((x) => x.truth, 0.12)(I, a) : a == null || !Number.isFinite(a) ? "Enter a number." : a === I.truth ? true : a < I.truth ? "Too few: recheck the copies, the watermark headroom and the spare." : "More than needed: recheck your arithmetic."),
+    solve: (I) => (I.lv === 1 ? +I.truth.toFixed(1) : I.truth),
+    bad: (I) => (I.lv === 1 ? [+(I.truth / 2).toFixed(1), +((I.raw * I.ratio * I.ret) / 1000).toFixed(1)] : [I.truth - 1, Math.ceil(I.lv === 2 ? (I.raw * I.ratio * I.ret) / 1000 / I.node : (I.raw * I.ratio * I.hotDays) / 1000 / I.hotNode)]),
+    hint: (I) => "GB/day × expansion × (1 + replicas) × days, then divide by 0.85 for watermark headroom." + (I.lv > 1 ? " Round up the node count, then add one." : ""),
+    concept: "Storage sizing for retention",
+    how: "Disk needed = daily raw volume × index expansion (mappings, doc values and compression can make indexed data larger or smaller than raw) × (1 + replicas) × days kept. Usable capacity is lower than raw disk: above the 85% low watermark no new shards are allocated and at 90% shards are moved away, so plan for at most ~85%. Add a node's worth of headroom so that losing a node (its shards are rebuilt on the others) doesn't push the survivors over the watermarks. With hot-warm, size each tier for the days it holds.",
+    rule: "Measure the expansion ratio on real data, then size: volume × ratio × copies × days ÷ 0.85, plus N+1 for failures, per tier.",
+    why: (I) => I.lv === 1 ? `${I.raw} × ${I.ratio} × 2 × ${I.ret} ÷ 0.85 ≈ ${I.total.toFixed(1)} TB.` : I.lv === 2 ? `${I.total.toFixed(1)} TB ÷ ${I.node} TB = ${(I.total / I.node).toFixed(2)} → ${Math.ceil(I.total / I.node)} nodes, +1 spare = ${I.truth}.` : `Hot holds ${I.raw} × ${I.ratio} × 2 × ${I.hotDays} ÷ 0.85 ≈ ${I.hot.toFixed(1)} TB → ${Math.ceil(I.hot / I.hotNode)} nodes of ${I.hotNode} TB, +1 spare = ${I.truth}.`,
+  });
+
+  /* ---------- N2. Vector memory ---------- */
+  MORE.push({
+    id: "es-vector-memory",
+    name: "RAM for approximate kNN",
+    kind: "Estimate",
+    skills: ["estimate"],
+    w: "num",
+    gen(lv, R) {
+      const n = R.pick([5, 10, 20, 40]) * 1e6, d = R.pick([384, 768, 1024]);
+      const f32 = (n * 4 * (d + 12)) / 1e9, i8 = (n * (d + 4)) / 1e9;
+      if (lv === 1) return { lv, n, d, truth: f32 };
+      if (lv === 2) { const nodes = R.pick([3, 4, 6]); return { lv, n, d, nodes, truth: (i8 * 2) / nodes }; }
+      const budget = R.pick([16, 24, 32]);
+      const bbq = (n * (d / 8 + 14)) / 1e9;
+      return { lv, n, d, budget, i8, bbq, truth: Math.ceil((i8 * 2) / budget) };
+    },
+    text: (I) => `<p>The semantic search index holds <b>${K.num(I.n / 1e6)}M</b> vectors of <b>${I.d}</b> dimensions in a <code>dense_vector</code> field with HNSW. For fast kNN the vectors and graph must fit in the page cache (off-heap RAM). Use the sizing rules of thumb from Elasticsearch's kNN tuning guide: <code>float</code> ≈ N × 4 × (dims + 12) bytes, <code>int8</code> ≈ N × (dims + 4) bytes.</p><p>${I.lv === 1 ? "With <code>float</code> vectors (no quantization), how many <b>GB</b> of RAM does one copy need?" : I.lv === 2 ? `With <code>int8_hnsw</code>, 1 replica and the copies spread evenly over <b>${I.nodes}</b> data nodes, how many <b>GB per node</b>?` : `With <code>int8_hnsw</code> and 1 replica, each node can give <b>${I.budget} GB</b> to the page cache for vectors. How many data nodes do you need at minimum?`}</p>`,
+    ui: (I) => ({ unit: I.lv === 3 ? "nodes" : "GB" }),
+    accept: (I, a) => (I.lv === 3 ? (a === I.truth ? true : a == null || !Number.isFinite(a) ? "Enter a number." : a < I.truth ? "Too few nodes: count both copies." : "More than needed.") : LB.near((x) => x.truth, 0.12)(I, a)),
+    solve: (I) => (I.lv === 3 ? I.truth : +I.truth.toFixed(1)),
+    bad: (I) => (I.lv === 1 ? [+((I.n * I.d) / 1e9).toFixed(1)] : I.lv === 2 ? [+((I.n * (I.d + 4)) / 1e9).toFixed(1), +((I.n * 4 * (I.d + 12) * 2) / 1e9 / I.nodes).toFixed(1)] : [Math.ceil(I.i8 / I.budget) === I.truth ? I.truth - 1 : Math.ceil(I.i8 / I.budget)]),
+    hint: (I) => I.lv === 1 ? "4 bytes per float dimension, plus the per-vector overhead in the formula." : I.lv === 2 ? "int8 stores one byte per dimension. Count both copies, then divide by nodes." : "Total = per-copy size × 2 copies; divide by the per-node budget and round up.",
+    concept: "Memory sizing for HNSW vector search",
+    how: "Approximate kNN with HNSW is fast only while the vectors and graph are in memory (the OS page cache, outside the JVM heap); once they spill to disk, latency jumps by orders of magnitude. Raw float32 vectors cost 4 bytes per dimension. Scalar quantization (<code>int8_hnsw</code>, the default for dense_vector in recent 8.x versions) cuts that to ~1 byte per dimension with a small recall loss (rescoring recovers most of it); <code>int4</code> and BBQ (binary quantization) go further. Every replica needs its own copy in memory on its node.",
+    rule: "Size vector RAM per copy from dims × bytes-per-dim × N, quantize (int8 or BBQ) before buying RAM, and remember replicas multiply the memory.",
+    why: (I) => I.lv === 1 ? `${K.num(I.n / 1e6)}M × 4 × (${I.d} + 12) bytes ≈ ${I.truth.toFixed(1)} GB.` : I.lv === 2 ? `${K.num(I.n / 1e6)}M × (${I.d} + 4) bytes × 2 copies ÷ ${I.nodes} nodes ≈ ${I.truth.toFixed(1)} GB per node.` : `int8: ${I.i8.toFixed(1)} GB per copy × 2 = ${(I.i8 * 2).toFixed(1)} GB ÷ ${I.budget} GB → ${I.truth} nodes. BBQ would need only ~${(I.bbq * 2).toFixed(1)} GB in total.`,
+  });
+
+  /* ---------- Q1. Filter and request caches ---------- */
+  MORE.push({
+    id: "es-query-cache",
+    name: "Why is the dashboard never cached?",
+    kind: "Decision",
+    skills: ["diagnose", "tune"],
+    w: "choice",
+    gen(lv, R) {
+      const users = R.int(30, 80);
+      const q = lv === 1 ? { query: { bool: { must: [{ match: { title: "outage" } }, { term: { status: "open" } }, { range: { priority: { gte: 2 } } }] } } }
+        : lv === 2 ? { query: { bool: { filter: [{ term: { service: "checkout" } }, { range: { "@timestamp": { gte: "now-15m" } } }] } }, size: 50 }
+          : { size: 20, query: { bool: { filter: [{ range: { "@timestamp": { gte: "now-24h" } } }] } }, aggs: { per_hour: { date_histogram: { field: "@timestamp", fixed_interval: "1h" } } } };
+      const stats = lv === 1 ? "query_cache: hit_count 0, miss_count 0, cache_size 0" : lv === 2 ? `query_cache: hit_count 1,204, miss_count 2,871,330, evictions 2,790,112` : `request_cache: hit_count 0, miss_count 0, memory_size 0b; query_cache: hit_count 81,220`;
+      const right = lv === 1 ? "Move the status and priority clauses into filter: they don't need scores and filter clauses can be cached" : lv === 2 ? "Round the range to now-15m/m so the clause is identical for a whole minute and can be cached" : "Request the aggregation with size: 0 and round the range (now-24h/h), so the shard request cache can serve repeats";
+      const wrong = lv === 1 ? ["Increase indices.queries.cache.size to 30%", "Add a replica so the cache is warmed on more nodes", "Force-merge the index to one segment"]
+        : lv === 2 ? ["Increase indices.queries.cache.size so fewer entries are evicted", "Move the range clause into must", "Reduce size to 10"]
+          : ["Set index.requests.cache.enable: true (it's off)", "Only round the range to the hour; size doesn't matter", "Only set size: 0; now-24h is fine"];
+      return { lv, users, q, stats, opts: R.shuffle([right, ...wrong]), right };
+    },
+    text: (I) => `<p>${I.users} people keep a dashboard open that refreshes every 30 seconds and sends:</p>${K.pre(JP(I.q))}<p>Node stats for the index show <code>${esc(I.stats)}</code>. Which change makes repeated requests cheap?</p>`,
+    ui: (I) => ({ opts: I.opts }),
+    ans: (I) => I.right,
+    diag: () => "That doesn't address why nothing is being cached. Look at what makes a clause or request cacheable.",
+    hint: (I) => I.lv === 1 ? "Only filter-context clauses are eligible for the node query cache." : I.lv === 2 ? "now changes every millisecond, so each request's range is a different query." : "The shard request cache only caches size: 0 requests by default, and its key is the whole request.",
+    concept: "Node query cache and shard request cache",
+    how: "The node query cache stores bitsets for filter-context clauses (filter, must_not, constant_score) on segments that are reused often; scoring clauses in must are never cached. A range on bare <code>now</code> is a new query every millisecond, so it can't be reused; rounding (<code>now-15m/m</code>) makes it identical for a minute. The shard request cache stores whole per-shard results of <code>size: 0</code> requests (aggregations, counts) by default, keyed on the full request, and is invalidated on refresh; requests that return hits aren't cached unless <code>request_cache=true</code> is passed.",
+    rule: "Put yes/no clauses in filter, round now in date math, and send dashboard aggregations as size: 0 requests.",
+    why: (I) => I.lv === 1 ? "All three clauses ran in scoring (must) context, so nothing was eligible for the query cache: zero hits and zero misses." : I.lv === 2 ? "The filter was in the right place, but now-15m produced a different range every millisecond: millions of misses and evictions." : "The request returned 20 hits, so the shard request cache skipped it (0 hits, 0 misses), and the unrounded now-24h would have changed the cache key every request anyway.",
+  });
+
+  /* ---------- Q2. Shard count decisions ---------- */
+  MORE.push({
+    id: "es-oversharding",
+    name: "Too many shards, or too big?",
+    kind: "Decision",
+    skills: ["diagnose", "design"],
+    w: "choice",
+    gen(lv, R) {
+      const facts = lv === 1 ? `${R.int(6, 8)} data nodes with 30 GB heap hold <b>${K.num(R.int(10, 14) * 1000)} shards</b>; the median shard is 0.6 GB (daily indices × 5 primaries for 40 small services). The elected master runs at 90% CPU, cluster-state updates take 20+ s and pending tasks pile up.`
+        : lv === 2 ? `The cluster has 600 shards, but the main <code>events</code> index has 6 primaries of <b>${R.int(320, 450)} GB</b> each. After a node failure, recovery took 9 hours with the 10 Gbit network saturated; force-merges never finish.`
+          : `A SaaS app gives each of its <b>${K.num(R.int(18, 25) * 100)} tenants</b> its own index (1 primary, 1 replica). 90% of tenants have under 50 MB of data. Every mapping change for a new feature takes hours to roll out and the cluster state is 600 MB.`;
+      const right = lv === 1 ? "Consolidate: fewer primaries, size-based rollover (~40 GB per shard) instead of daily indices, and shrink or reindex the old small indices" : lv === 2 ? "Use smaller shards: rollover at max_primary_shard_size 50gb and split or reindex the existing index into more primaries" : "Put small tenants in shared indices with a tenant_id field (filtered aliases or routing) and keep dedicated indices only for the largest tenants";
+      const wrong = lv === 1 ? ["Raise cluster.max_shards_per_node so new indices keep being created", "Add more replicas to spread the load", "Give the master nodes more heap and leave the indices alone"] : lv === 2 ? ["Raise indices.recovery.max_bytes_per_sec", "Add a second replica so recovery has more sources", "Merge everything into one shard to simplify recovery"] : ["Raise cluster.max_shards_per_node to 5,000", "Run 5 master-eligible nodes instead of 3", "Give each tenant its own cluster"];
+      return { lv, facts, opts: R.shuffle([right, ...wrong]), right };
+    },
+    text: (I) => `<p>${I.facts}</p><p>What's the right structural fix?</p>`,
+    ui: (I) => ({ opts: I.opts }),
+    ans: (I) => I.right,
+    diag: () => "That treats a symptom. What does the evidence say about shard count and shard size?",
+    hint: (I) => I.lv === 1 ? "Each shard has fixed overhead on the master and on the data nodes, however small it is." : I.lv === 2 ? "Recovery and merges work shard by shard; the network is already maxed out." : "Index-per-tenant multiplies shards and mappings by the tenant count.",
+    concept: "Oversharding and undersharding",
+    how: "Every shard costs heap, file handles and cluster-state entries, and the master must track and publish all of them; thousands of tiny shards (daily indices for small streams, too many primaries, index-per-tenant) slow the master and waste memory, and raising <code>cluster.max_shards_per_node</code> only hides that. Very large shards make recovery, relocation and merges slow and lumpy. Aim for 10–50 GB per shard with size-based rollover; consolidate small data (shrink, reindex, shared multi-tenant indices with routing or filtered aliases) and split oversized indices.",
+    rule: "Keep shards between 10 and 50 GB, roll over by size, and share indices between small tenants instead of creating one index each.",
+    why: (I) => I.lv === 1 ? "Thousands of sub-GB shards overload the master's cluster state; consolidating to ~40 GB shards cuts the count by an order of magnitude." : I.lv === 2 ? "Recovery moves whole shards; with the network saturated only smaller shards (more of them in parallel, each finishing sooner) shorten it." : "Thousands of tiny indices each carry their own shards and mapping; shared indices for small tenants shrink both the shard count and the cluster state.",
+  });
+
+  /* ---------- T. Failure domains (topology) ---------- */
+  function domainSpec(I) {
+    const nodes = I.nodes.map((n) => ({ label: n.name, x: n.x, y: n.y, sub: n.sub }));
+    return { nodes, links: [], mode: "nodes", W: I.W, H: I.H, nodeVerb: "patched now", aria: "Cluster nodes by zone" };
+  }
+  function domainCheck(I, down) {
+    const dn = new Set(down.map((i) => I.nodes[i].name));
+    const lostShard = I.shards.find((s) => s.copies.every((n) => dn.has(n)));
+    const masters = I.nodes.filter((n) => n.master), mDown = masters.filter((n) => dn.has(n.name)).length;
+    return { lostShard, quorum: !masters.length || masters.length - mDown > masters.length / 2, mDown };
+  }
+  MORE.push({
+    id: "es-failure-domains",
+    name: "How many nodes can you patch at once?",
+    kind: "Hardening",
+    skills: ["design", "safe"],
+    w: "topo",
+    sense: "max",
+    vname: "nodes patched at once:",
+    gen(lv, R) {
+      const zones = lv === 1 ? [""] : ["a", "b", "c"];
+      const nodes = [];
+      if (lv === 1) for (let i = 0; i < 5; i++) nodes.push({ name: `data-${i + 1}`, zone: "", data: true });
+      else { zones.forEach((z) => { for (let i = 0; i < (lv === 3 ? 2 : 2); i++) nodes.push({ name: `data-${z}${i + 1}`, zone: z, data: true }); }); const mz = lv === 2 ? ["a", "a", "b"] : ["a", "b", "c"]; mz.forEach((z, k) => nodes.push({ name: `master-${k + 1}`, zone: z, master: true })); }
+      const data = nodes.filter((n) => n.data);
+      const shards = [];
+      const add = (idx, s, copies) => shards.push({ id: `${idx}${s}`, copies });
+      if (lv === 1) {
+        const p = R.shuffle([0, 1, 2, 3, 4]);
+        for (let s = 0; s < 4; s++) add("o", s, [data[p[s % 5]].name, data[p[(s + 1 + (s % 2)) % 5]].name]);
+        add("i", 0, [data[p[4]].name]);
+      } else {
+        const off = R.int(0, 2), flip = R.int(0, 1);
+        for (let s = 0; s < 6; s++) { const z1 = zones[(s + off) % 3], z2 = zones[(s + off + 1) % 3]; const w = (Math.floor(s / 3) + flip) % 2; add("o", s, [data.filter((n) => n.zone === z1)[w].name, data.filter((n) => n.zone === z2)[1 - w].name]); }
+        if (lv === 3) { const z = R.pick(zones); add("m", 0, data.filter((n) => n.zone === z).map((n) => n.name)); }
+      }
+      nodes.forEach((n) => { n.sub = n.master ? `master${n.zone ? " · zone " + n.zone : ""}` : shards.filter((s) => s.copies.includes(n.name)).map((s) => s.id).join(" ") || "–"; });
+      const cols = lv === 1 ? 5 : 3;
+      nodes.forEach((n, i) => { if (lv === 1) { n.x = 70 + i * 125; n.y = 100; } else { const zi = zones.indexOf(n.zone); const within = nodes.filter((m) => m.zone === n.zone && !m.master).indexOf(n); n.x = 75 + zi * 230 + (n.master ? 57 : within * 115); n.y = n.master ? 170 + nodes.filter((m) => m.master && m.zone === n.zone).indexOf(n) * 52 : 70; } });
+      void cols;
+      return { lv, nodes, shards, H: lv === 1 ? 170 : 260, W: lv === 1 ? 640 : 710 };
+    },
+    text: (I) => `<p>A security patch needs every node restarted. To save time you'll patch several nodes <b>at the same time</b>. Labels show which shard copies each node holds (${I.lv === 1 ? "<code>o0</code>–<code>o3</code> are the orders index; <code>i0</code> belongs to an import index" : "<code>o*</code> = orders"}${I.lv === 3 ? "; <code>m0</code> is a metrics index that was pinned to one zone during a migration" : ""})${I.lv > 1 ? "; masters are dedicated master-eligible nodes" : ""}.</p><p>Select the <b>largest</b> set of nodes you can take down together without any shard losing all its copies${I.lv > 1 ? " and without losing the master quorum" : ""}.</p>`,
+    ui: (I) => ({ ...domainSpec(I), live: (a) => { const r = domainCheck(I, (a && a.down) || []); return K.metrics([{ name: "Every shard has a live copy", value: r.lostShard ? `${r.lostShard.id} lost` : "yes", ok: !r.lostShard }, ...(I.lv > 1 ? [{ name: "Master quorum", value: r.quorum ? "kept" : "lost", ok: r.quorum, target: "majority of 3 masters up" }] : [])]); } }),
+    valid: (I, a) => { const r = domainCheck(I, a.down); if (r.lostShard) return `every copy of shard ${r.lostShard.id} would be offline (red)`; if (!r.quorum) return `${r.mDown} of 3 master-eligible nodes would be down: no quorum, no elected master, the whole cluster stops`; return true; },
+    val: (I, a) => a.down.length,
+    hint: (I) => I.lv === 1 ? "Look for a shard with a single copy." : I.lv === 2 ? "Zone awareness puts a shard's copies in different zones, so one zone's data nodes can go together. Count the masters per zone." : "Check the shard that isn't spread across zones.",
+    concept: "Failure domains: replicas, zone awareness and master quorum",
+    how: "A shard stays available while at least one copy is up; with shard allocation awareness (<code>cluster.routing.allocation.awareness.attributes: zone</code>), copies are placed in different zones so a whole zone can fail or be patched at once. Indices with 0 replicas, or pinned to one zone by allocation filters, break that guarantee. The cluster also needs a majority of master-eligible nodes to elect a master: three masters tolerate one loss, and putting two of them in the same zone means that zone's failure stops the cluster.",
+    rule: "Spread replicas with zone awareness, spread the three master-eligible nodes over three zones, and audit for 0-replica or pinned indices before relying on 'we can lose a zone'.",
+    why: (I, sol) => `The largest safe set takes down ${sol.down.length} node${sol.down.length === 1 ? "" : "s"}: ${sol.down.map((i) => esc(I.nodes[i].name)).join(", ")}.${I.lv === 2 ? " Two masters share zone a, so that zone's masters can't both go." : I.lv === 3 ? " The pinned metrics index blocks taking its whole zone down." : " The import index has a single copy, so its node must stay up."}`,
+  });
+
   /* ---------- registration (see c-es.js) ---------- */
   if (LB._esLoaded) LB.addAll("es", MORE);
   else LB._esMore = (LB._esMore || []).concat(MORE);
