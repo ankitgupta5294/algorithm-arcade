@@ -87,7 +87,7 @@
   };
 
   // Scenarios held back from play until their checks pass again.
-  LB.SKIP = new Set(["kafka-unclean-election", "k8s-pod-security"]);
+  LB.SKIP = new Set(["kafka-unclean-election"]);
   LB.add = function (def) {
     if (LB.SKIP.has(def.id)) return;
     const bad = (m) => { throw new Error(`lab scenario ${def.id || "?"}: ${m}`); };
