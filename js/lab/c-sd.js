@@ -763,7 +763,7 @@
     let hotMax = 0;
     const day1 = runDay(day(I.peak), (l, i) => {
       const v = I.viral * Math.exp(-(((i / 2 - I.spike) / 0.5) ** 2));
-      const origin = (l + v) * (1 - off), hot = v * (1 - off) * (local ? 0.02 : 1);
+      const origin = (l + v) * (1 - off), hot = cfg.gb ? v * (1 - off) * (local ? 0.02 : 1) : 0;
       hotMax = Math.max(hotMax, hot);
       const hotErr = hot > 100000 ? (hot - 100000) / origin : 0;
       const db = tier(l * (1 - off) * (1 - hit), reps, I.dbCap, 12, { timeout: 1000 });

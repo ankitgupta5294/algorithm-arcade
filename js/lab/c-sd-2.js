@@ -567,4 +567,496 @@
       why: (I, sol) => { const r = cpSim(I, sol); return `Cheapest safe set: ${sol.map((i) => esc(CP[i].t.split(" (")[0])).join("; ") || "none"}: web ${K.num(r.web)} req/s, Postgres ${K.num(r.db)} q/s, ${mo(r.cost)}.`; },
     },
   ]);
+
+  /* ---------- consistency classification ---------- */
+  const CONS = {
+    strong: ["Reserve the last seat on a flight", "Debit a prepaid wallet (the balance must never go negative)", "Claim a unique username at signup", "Redeem a single-use gift card code", "Acquire the job scheduler's leader lease", "Transfer money between two accounts"],
+    ryw: ["A user edits their display name and reloads their own profile", "A user posts a comment and expects to see it under the post", "A user changes notification settings and reopens the settings page", "A seller updates a listing's photos and checks the listing"],
+    eventual: ["Like count on a viral post", "'Customers also bought' recommendations", "Follower count shown on other people's profiles", "Search results including a product added a minute ago", "Daily active users on the analytics dashboard", "Trending hashtags", "'Only 3 left!' badge on the product page (checkout re-checks stock)"],
+  };
+
+  /* ---------- feature shedding ---------- */
+  const SHED = [
+    { id: "recs", t: "Personalised recommendations", load: 12, v: 3 },
+    { id: "auto", t: "Search autocomplete", load: 6, v: 2 },
+    { id: "rev", t: "Reviews and ratings widget", load: 5, v: 2 },
+    { id: "recent", t: "Recently viewed items", load: 3, v: 1 },
+    { id: "badge", t: "Live stock badges", load: 4, v: 1 },
+    { id: "hist", t: "Order history pages", load: 7, v: 3 },
+    { id: "wish", t: "Wishlists", load: 4, v: 2 },
+    { id: "search5", t: "Degrade: serve search from a 5-minute cache", load: 8, v: 1, lv: 3 },
+    { id: "img", t: "Degrade: lower image quality on product pages", load: 5, v: 1, lv: 3 },
+    { id: "checkout", t: "Checkout and payment", load: 20, v: 50, core: true },
+    { id: "login", t: "Login and sessions", load: 8, v: 50, core: true },
+    { id: "pdp", t: "Product pages", load: 18, v: 50, core: true },
+  ];
+  function shedSim(I, sel) {
+    const opts = I.feats.map((k) => SHED[k]);
+    const shedSet = new Set(sel || []);
+    const base = opts.reduce((s, f, i) => s + (shedSet.has(i) ? 0 : f.load), 0) + I.fixed;
+    const util = (base * I.x) / 100;
+    const core = opts.find((f, i) => shedSet.has(i) && f.core);
+    const lost = opts.reduce((s, f, i) => s + (shedSet.has(i) ? f.v : 0), 0);
+    const t = tier(util * 100, 100, 1, 40, { slots: 8 });
+    let fail = null;
+    if (core) fail = `${core.t} is the business: shedding it is an outage, not a degradation`;
+    else if (util > 0.85) fail = `the fleet would run at ${pc(util)} (keep ≤ 85% so p99 holds)`;
+    return { util, lost, p99: t.p99, fail };
+  }
+
+  /* ---------- edge vs regions ---------- */
+  const ER_USERS = ["NA", "EU", "APAC"], ER_REG = { "US only": ["US"], "US + EU": ["US", "EU"], "US + APAC": ["US", "APAC"], "US + EU + APAC": ["US", "EU", "APAC"] };
+  function erSim(I, cfg) {
+    const regs = ER_REG[cfg.regions], edge = cfg.edge === "on", res = [];
+    ER_USERS.forEach((u, i) => {
+      const s = regs.reduce((b, r) => (I.rtt[i][r] < I.rtt[i][b] ? r : b), regs[0]), r = I.rtt[i][s];
+      const read = edge ? 2 * 15 + r + 40 : 3 * r + 40;
+      const write = edge ? 2 * 15 + I.rtt[i].US + 40 : 3 * r + (s === "US" ? 0 : I.toUS[s]) + 40;
+      res.push({ u, s, read, write });
+    });
+    const cost = (regs.length - 1) * I.regionPrice + (edge ? I.edgePrice : 0);
+    let fail = null;
+    const badR = res.find((x) => x.read > I.readSlo), badW = I.writeSlo ? res.find((x) => x.write > I.writeSlo) : null;
+    if (badR) fail = `${badR.u} users wait ${badR.read} ms for a first read (target ${I.readSlo} ms)`;
+    else if (badW) fail = `${badW.u} users wait ${badW.write} ms for a write (target ${I.writeSlo} ms)`;
+    return { res, cost, fail };
+  }
+
+  /* ---------- launch war room ---------- */
+  const WR_HIT = { 0: 0, 16: 0.5, 32: 0.7, 64: 0.8 };
+  function wrDay(I, c, coarse) {
+    const hit = WR_HIT[c.cache], shed = c.shed, apiF = shed ? 0.75 : 1, rpr = (shed ? 1.5 : 2) * (1 - hit);
+    const conn = c.api * 20 > I.maxConn ? 1 - I.maxConn / (c.api * 20) : 0;
+    let loads = day(I.peak, { spike: I.spikeAt, x: I.spike });
+    if (coarse) { const mx = Math.max(...loads); loads = loads.filter((l) => l > 0.6 * mx); }
+    return runDay(loads, (l) => {
+      let err = 0, r = null;
+      for (let it = 0; it < (coarse ? 6 : 12); it++) {
+        const amp = c.retries === "immediate-3x" ? 3 * err : Math.min(0.1, 2 * err), L = l * (1 + amp);
+        const a = tier(L * apiF, c.api, I.apiCap, 30, { timeout: 3000 }), d = tier(L * rpr, c.reps, I.dbCap, 8, { timeout: 3000 });
+        const e = 1 - (1 - a.err) * (1 - d.err) * (1 - conn);
+        r = { p99: a.p99 + d.p99, err: e, rho: Math.max(a.rho, d.rho), a: a.rho, d: d.rho };
+        err = e;
+      }
+      return r;
+    });
+  }
+  const wrCost = (I, c) => c.api * I.apiPrice + c.reps * I.repPrice + c.cache * I.gbPrice;
+  const wrPass = (I, c, coarse) => { const d = wrDay(I, c, coarse); return d.worst <= I.slo && d.peakErr <= 0.005; };
+  function wrBest(I) {
+    let best = null;
+    for (const retries of [I.init.retries]) for (const shed of I.lv === 3 ? [false, true] : [false]) for (const cache of [0, 16, 32, 64]) for (let reps = 1; reps <= 8; reps++) {
+      const lim = Math.min(120, Math.floor(I.maxConn / 20));
+      for (let api = 4; api <= lim; api++) {
+        const c = { api, reps, cache, retries, shed };
+        if (best && wrCost(I, c) >= best.cost) break;
+        if (wrPass(I, c, true) && wrPass(I, c, false)) { best = { c, cost: wrCost(I, c) }; break; }
+      }
+    }
+    return best;
+  }
+  function wrShell(I) {
+    const cfgOf = (st) => st.c;
+    const simText = (st) => {
+      const d = wrDay(I, st.c), rows = [];
+      for (let i = 0; i < 48; i += 4) rows.push([SD.hm(i / 2), K.ms(d.p99[i]), pc(d.err[i])]);
+      const sp = Math.round(I.spikeAt * 2); rows.push([SD.hm(I.spikeAt) + " (launch)", K.ms(d.p99[sp]), pc(d.err[sp])]);
+      const ok = d.worst <= I.slo && d.peakErr <= 0.005;
+      return K.cols([["TIME", "P99", "ERRORS"], ...rows]) + `\n\nworst p99 ${K.ms(d.worst)} (SLO ${I.slo} ms) · worst error rate ${pc(d.peakErr)} (SLO 0.5%) · api ${pc(Math.min(9.99, d.maxRho))} peak util\nverdict: ${ok ? "PASS" : "FAIL"} · cost ${mo(wrCost(I, st.c))} (budget ${mo(I.budget)})`;
+    };
+    const sh = K.shell([
+      { re: /^launchctl status$/, use: "launchctl status", desc: "current capacity plan", run: (m, st) => { const c = cfgOf(st); return K.cols([["COMPONENT", "SETTING"], ["api replicas", `${c.api} × ${I.apiCap} req/s, 20 DB connections each (max_connections ${I.maxConn})`], ["db read replicas", `${c.reps} × ${K.num(I.dbCap)} reads/s`], ["cache", `${c.cache} GB (hit ratio ${pc(WR_HIT[c.cache])})`], ["client retries", c.retries], ["recommendations", c.shed ? "SHED" : "on"], ["monthly cost", `${mo(wrCost(I, c))} of ${mo(I.budget)} budget`]]); } },
+      { re: /^launchctl forecast$/, use: "launchctl forecast", desc: "traffic forecast for launch day", run: () => `evening peak ${K.num(I.peak)} req/s; launch at ${SD.hm(I.spikeAt)} spikes to ${K.num(I.peak * I.spike)} req/s\neach request: API work + 2 DB reads (cache first; recommendations cause 0.5 of them) + 0.1 writes\nrecommendations are 25% of API work` },
+      { re: /^launchctl simulate$/, use: "launchctl simulate", desc: "replay launch day against the current plan", run: (m, st) => simText(st) },
+      { re: /^launchctl scale api (\d+)$/, use: "launchctl scale api <n>", desc: "set API replicas", run: (m, st) => { st.c.api = Math.max(1, Math.min(200, +m[1])); return `api scaled to ${st.c.api} replicas (${st.c.api * 20} DB connections)`; } },
+      { re: /^launchctl db replicas (\d+)$/, use: "launchctl db replicas <n>", desc: "set read replica count", run: (m, st) => { st.c.reps = Math.max(1, Math.min(12, +m[1])); return `read replicas: ${st.c.reps}`; } },
+      { re: /^launchctl cache resize (\d+)$/, use: "launchctl cache resize <0|16|32|64>", desc: "resize the cache (GB)", run: (m, st) => { if (WR_HIT[+m[1]] == null) return "error: size must be 0, 16, 32 or 64"; st.c.cache = +m[1]; return `cache resized to ${st.c.cache} GB (warms in ~20 min)`; } },
+      { re: /^launchctl retries (immediate-3x|backoff-jitter-2x)$/, use: "launchctl retries <immediate-3x|backoff-jitter-2x>", desc: "client retry policy (pushed via remote config)", run: (m, st) => { st.c.retries = m[1]; return `client retry policy: ${m[1]}${m[1] === "backoff-jitter-2x" ? " (with a 10% retry budget)" : ""}`; } },
+      { re: /^launchctl (shed|unshed) recommendations$/, use: "launchctl shed|unshed recommendations", desc: "turn recommendations off/on", run: (m, st) => { st.c.shed = m[1] === "shed"; st.shedTouched = true; return `recommendations ${st.c.shed ? "shed (hidden on all pages)" : "back on"}`; } },
+      { re: /^launchctl cache flush$/, use: "launchctl cache flush", desc: "flush the cache", run: () => ({ out: "cache flushed", danger: "a cold cache sends every read to the database at once" }) },
+      { re: /^launchctl db failover$/, use: "launchctl db failover", desc: "fail over the primary", run: () => ({ out: "failover complete in 41 s", danger: "an unnecessary failover dropped all writes for 41 s" }) },
+    ], { sh: "bash" });
+    return {
+      prompt: "$", init: { c: { ...I.init } }, run: (line, st) => sh.run(line, st), par: I.solve.length + 3,
+      motd: `Launch day prep for ${I.app} · go-live ${SD.hm(I.spikeAt)}\nSLO: p99 ≤ ${I.slo} ms, errors ≤ 0.5% · budget ${mo(I.budget)}/month\nType "help". Start with launchctl forecast / launchctl simulate.`,
+      cmds: ["launchctl status", "launchctl forecast", "launchctl simulate", "launchctl scale api <n>", "launchctl db replicas <n>", "launchctl cache resize <gb>", "launchctl retries <policy>", "launchctl shed recommendations"],
+      live: (a) => { const st = a && a.st ? a.st : { c: { ...I.init } }; const d = wrDay(I, st.c); return K.metrics([{ name: "Worst p99", value: K.ms(d.worst), ok: d.worst <= I.slo, target: `≤ ${I.slo} ms` }, { name: "Worst errors", value: pc(d.peakErr), ok: d.peakErr <= 0.005, target: "≤ 0.5%" }, { name: "Monthly cost", value: mo(wrCost(I, st.c)), ok: wrCost(I, st.c) <= I.budget, target: `≤ ${mo(I.budget)}` }]) + dayChart(d, I.slo); },
+    };
+  }
+
+  /* ---------- queue smoothing ---------- */
+  function qsSim(I, cfg) {
+    const half = day(I.peak, { spike: 12, x: I.spike }), steps = [];
+    half.forEach((v) => { for (let k = 0; k < 6; k++) steps.push(v); });
+    const sync = cfg.mode === "synchronous call";
+    const out = Math.min(cfg.cons * I.per, I.wh);
+    let back = 0, worst = 0, worstX = 0, err = 0, tot = 0;
+    const age = [];
+    steps.forEach((inR) => {
+      tot += inR;
+      if (sync) { if (inR > I.wh) err += inR - I.wh; age.push(0); return; }
+      back = Math.max(0, back + (inR - out) * 300);
+      const a = back / out / 60;
+      // a priority lane serves express first, so express only waits if express alone outruns the consumers
+      const ax = !I.express ? 0 : cfg.lanes === "priority lane for express" ? (inR * I.express > out ? 99 : 0) : a;
+      age.push(a); worst = Math.max(worst, a); worstX = Math.max(worstX, ax);
+    });
+    const cost = sync ? 0 : cfg.cons * I.price + I.qPrice + (I.express && cfg.lanes === "priority lane for express" ? I.lanePrice : 0);
+    let fail = null;
+    if (sync && err > 0) fail = `at peak the warehouse API rejects ${pc(err / tot)} of the day's orders with 429s (it accepts ${K.num(I.wh)}/s)`;
+    else if (!sync && cfg.cons * I.per > I.wh * 1.0001) fail = `${cfg.cons} consumers send ${K.num(cfg.cons * I.per)} msgs/s, above the warehouse API's ${K.num(I.wh)}/s: the excess just collects 429s`;
+    else if (!sync && worst > I.sla) fail = `the oldest message waits ${K.num(worst)} min at the worst point (limit ${I.sla} min)`;
+    else if (!sync && I.express && worstX > I.xsla) fail = `express orders wait up to ${K.num(worstX)} min behind standard orders (limit ${I.xsla} min)`;
+    return { age, worst, worstX, out, cost, fail };
+  }
+
+  /* ---------- DR plan ---------- */
+  function drSim(I, cfg) {
+    const restore = I.tb * 1 + 0.5; // hours: snapshot restore + WAL replay
+    const logical = { "daily snapshots": 24 * 3600, "hourly snapshots": 3600, "continuous WAL archiving (PITR)": 0 }[cfg.backup];
+    let region = { "daily snapshots": 24 * 3600, "hourly snapshots": 3600, "continuous WAL archiving (PITR)": 60 }[cfg.backup];
+    const hasX = cfg.replica !== "none", az0 = cfg.replica === "sync standby in another AZ + async cross-region" || cfg.replica === "sync cross-region replica";
+    if (cfg.replica === "async cross-region replica" || cfg.replica === "sync standby in another AZ + async cross-region") region = Math.min(region, 5);
+    if (cfg.replica === "sync cross-region replica") region = 0;
+    const az = az0 ? 0 : hasX ? 5 : region;
+    const rto = cfg.standby === "hot (full size, automated failover)" && hasX ? 5 / 60 : cfg.standby === "warm (scaled-down replica, scale up)" && hasX ? 0.5 : restore + (cfg.standby === "cold (provision on failover)" ? 1 : 0.25);
+    const writeAdd = cfg.replica === "sync cross-region replica" ? I.xrtt : az0 ? 2 : 0;
+    const cost = I.price.backup[cfg.backup] + I.price.replica[cfg.replica] + I.price.standby[cfg.standby];
+    let fail = null;
+    const f = (s) => (s >= 3600 ? s / 3600 + " h" : s >= 60 ? s / 60 + " min" : s + " s");
+    if (cfg.standby !== "cold (provision on failover)" && !hasX) fail = "a warm or hot standby needs a cross-region replica to keep it current";
+    else if (region > I.rpoRegion) fail = `losing the region loses up to ${f(region)} of writes (RPO ${f(I.rpoRegion)})`;
+    else if (rto > I.rtoRegion) fail = `recovering from a region loss takes ~${K.num(rto, 1)} h (RTO ${K.num(I.rtoRegion, 2)} h)`;
+    else if (logical > I.rpoLogical) fail = `a bad migration that deletes rows replicates everywhere; restoring loses up to ${f(logical)} (RPO ${f(I.rpoLogical)})`;
+    else if (I.rpoAz === 0 && az > 0) fail = `losing the primary's AZ loses up to ${f(az)} of acknowledged writes (RPO 0)`;
+    else if (writeAdd > I.writeBudget) fail = `synchronous cross-region commits add ${writeAdd} ms to every write (budget ${I.writeBudget} ms)`;
+    return { region, logical, az, rto, cost, fail, writeAdd };
+  }
+
+  /* ---------- cells ---------- */
+  function cellSim(I, cfg) {
+    const n = cfg.cells, wave = Math.min(cfg.wave, Math.max(1, n - 1));
+    const waves = n === 1 ? 1 : 1 + need((n - 1) / wave), hours = (waves * I.bake) / 60;
+    const blast = 1 / n, wave2 = Math.min(1, (1 + wave) / n), cellCap = (I.users / n) * 1.3, whaleFits = !I.whale || I.whale * I.users <= 0.5 * cellCap;
+    const cost = n * I.fixed + I.users * I.perUser;
+    let fail = null;
+    if (blast > I.blast + 1e-9) fail = `one bad cell (poison tenant, bad config) takes out ${pc(blast)} of users (limit ${pc(I.blast)})`;
+    else if (I.wave2 && wave2 > I.wave2 + 1e-9) fail = `a bug noticed only after the second wave has reached ${pc(wave2)} of users (limit ${pc(I.wave2)})`;
+    else if (hours > I.deadline) fail = `a full rollout takes ${K.num(hours, 1)} h (${waves} waves × ${I.bake} min bake; limit ${I.deadline} h)`;
+    else if (!whaleFits) fail = `the largest tenant (${pc(I.whale)} of users) needs more than half of a ${M(I.users / n)}-user cell`;
+    return { blast, wave2, hours, waves, cost, fail };
+  }
+
+  /* ---------- SPOF hunt ---------- */
+  const SPOF_POOL = {
+    1: [
+      { label: "DNS", sub: "managed, anycast", spof: false },
+      { label: "Load balancer", sub: "managed, 3 zones", spof: false },
+      { label: "API ×6", sub: "3 zones", spof: false },
+      { label: "Redis ×1", sub: "session store", spof: true, why: "every API call looks up the session in a single Redis node" },
+      { label: "Postgres", sub: "auto-failover standby", spof: false },
+      { label: "Payment provider", sub: "single provider", spof: true, why: "one provider, no fallback: if it's down, nobody can pay" },
+    ],
+    2: [
+      { label: "Load balancer", sub: "managed, 3 zones", spof: false },
+      { label: "API ×9", sub: "3 zones", spof: false },
+      { label: "NAT gateway", sub: "zone A only", spof: true, why: "every outbound call to the payment provider leaves through one NAT gateway in one zone" },
+      { label: "Config svc ×3", sub: "read per request", spof: false },
+      { label: "Feature flags ×1", sub: "SDK caches, fails open", spof: false },
+      { label: "Kafka ×3", sub: "RF=3, min.insync=2", spof: false },
+      { label: "Redis ×1", sub: "cart store", spof: true, why: "the cart lives only in one Redis node, so checkout can't read it" },
+      { label: "Postgres", sub: "primary + sync standby", spof: false },
+    ],
+    3: [
+      { label: "Load balancer", sub: "managed, 3 zones", spof: false },
+      { label: "API ×12", sub: "3 zones", spof: false },
+      { label: "Redis + Sentinel ×3", sub: "app pins primary IP", spof: true, why: "Sentinel promotes a replica, but the app has the old primary's IP hard-coded and never follows" },
+      { label: "Postgres", sub: "async, manual failover", spof: true, why: "failover is manual (~30 min), so losing the primary is an outage until someone acts" },
+      { label: "NAT ×2", sub: "one per zone", spof: false },
+      { label: "Auth svc ×4", sub: "2 zones", spof: false },
+      { label: "Receipts bucket", sub: "single region, async", spof: false },
+      { label: "Feature flags ×1", sub: "SDK caches, fails open", spof: false },
+      { label: "Internal CA", sub: "issues 24 h certs, ×1", spof: true, why: "service certificates live 24 h and only one CA instance renews them: if it's down for a day, every mTLS call fails" },
+    ],
+  };
+  const spofNodes = (I) => I.order.map((k) => SPOF_POOL[I.lv][k]);
+
+  /* ---------- notification pipeline ---------- */
+  const NP_STEPS = [
+    { id: "dedupe", t: "Drop duplicates by event ID (producers deliver at least once)" },
+    { id: "prefs", t: "Load the user's channel preferences and opt-outs" },
+    { id: "txn", t: "Route transactional messages (OTP, security alerts) around quiet hours and caps", lv: 3 },
+    { id: "quiet", t: "Quiet hours in the user's time zone: defer marketing messages until morning", lv: 2 },
+    { id: "cap", t: "Frequency cap: at most 3 marketing pushes per user per day", lv: 2 },
+    { id: "render", t: "Render the template in the user's locale" },
+    { id: "send", t: "Send via the provider with an idempotency key; retry 5xx and timeouts with backoff and jitter" },
+    { id: "record", t: "Record the outcome; delete device tokens the provider reports as unregistered" },
+    { id: "x1", t: "Send first, then check preferences to update analytics", trap: "opted-out users get messages" },
+    { id: "x2", t: "Retry 400 'invalid device token' responses until they succeed", trap: "a permanent error never succeeds; it just burns quota" },
+    { id: "x3", t: "Drop marketing messages that fall in quiet hours", trap: "quiet hours should defer, not lose, the message", lv: 2 },
+    { id: "x4", t: "Apply quiet hours using the server's time zone (UTC)", trap: "users in other time zones get woken at night", lv: 2 },
+    { id: "x5", t: "Apply the frequency cap to one-time passcodes too", trap: "a user who asks for a fourth OTP can't log in", lv: 3 },
+  ];
+  const NP_ALL = (lv) => NP_STEPS.filter((s) => !s.lv || s.lv <= lv);
+  const NP_REQ = (lv) => (lv === 1 ? ["dedupe", "prefs", "render", "send", "record"] : lv === 2 ? ["dedupe", "prefs", "quiet", "cap", "render", "send", "record"] : ["dedupe", "prefs", "txn", "quiet", "cap", "render", "send", "record"]);
+  const NP_ORDER = [["dedupe", "prefs"], ["prefs", "render"], ["prefs", "quiet"], ["prefs", "cap"], ["quiet", "render"], ["cap", "render"], ["txn", "quiet"], ["txn", "cap"], ["dedupe", "txn"], ["render", "send"], ["send", "record"]];
+  function npCheck(I, seq) {
+    const all = NP_ALL(I.lv), ids = seq.map((k) => all[I.order[k]].id), pos = (id) => ids.indexOf(id);
+    const trap = ids.map((id) => all.find((s) => s.id === id)).find((s) => s.trap);
+    if (trap) return `<b>${esc(trap.t)}</b>: ${esc(trap.trap)}.`;
+    const miss = NP_REQ(I.lv).filter((id) => pos(id) < 0);
+    if (miss.length) return `The pipeline is missing ${miss.length === 1 ? "a required step" : miss.length + " required steps"}.`;
+    for (const [a, b] of NP_ORDER) if (pos(a) >= 0 && pos(b) >= 0 && pos(a) > pos(b)) return `Order problem: <b>${esc(all.find((s) => s.id === b).t)}</b> can't come before <b>${esc(all.find((s) => s.id === a).t)}</b>.`;
+    return true;
+  }
+
+  /* ---------- degradation modes ---------- */
+  const DM = [
+    ["Auth token validation service is unreachable (any API call)", 0], ["Permission check for deleting a shared document times out", 0], ["Payment authorisation provider returns 503 at checkout", 0], ["Fraud check times out on a $4,000 order (policy: manual review above $500)", 0],
+    ["Rate limiter's Redis is unreachable", 1], ["Analytics event collector is down", 1], ["Fraud check times out on a $12 order (policy: auto-approve below $50)", 1],
+    ["Price service is down while rendering the catalog (checkout re-prices)", 2], ["Feature-flag service is down at startup (last-known flags cached on disk)", 2], ["Exchange-rate API is down when showing local-currency estimates", 2], ["Config service unreachable (last good config in memory)", 2],
+    ["Recommendations service times out on the product page", 3], ["Reviews service is down", 3], ["Search suggestions service is down", 3], ["Loyalty-points widget in the header can't load", 3],
+  ];
+
+  LB.addAll("sd", [
+    {
+      id: "sd-consistency",
+      name: "Choose consistency per feature",
+      kind: "Design review",
+      skills: ["design", "comms"],
+      w: "classify",
+      gen(lv, R) {
+        const pick = (k, n) => R.sample(CONS[k], n).map((t) => ({ t, c: k }));
+        const items = lv === 1 ? [...pick("strong", 3), ...pick("eventual", 3)] : lv === 2 ? [...pick("strong", 2), ...pick("ryw", 2), ...pick("eventual", 3)] : [...pick("strong", 3), ...pick("ryw", 2), ...pick("eventual", 3)];
+        if (lv === 3 && !items.some((x) => /Only 3 left/.test(x.t))) items[items.length - 1] = { t: CONS.eventual[6], c: "eventual" };
+        return { lv, items: R.shuffle(items) };
+      },
+      text: (I) => `<p>A product spans several regions. Strong (linearizable) operations need a coordinated write across replicas (~100 ms and less availability during a partition); weaker guarantees are local and cheap. For each feature, pick the <b>weakest guarantee that is still correct</b>:</p><ul><li><b>Strong</b>: every read sees the latest committed write; conflicting operations are serialised.</li>${I.lv > 1 ? "<li><b>Read-your-writes</b>: a user always sees their own changes (e.g. route that user's reads to the primary or a caught-up replica for a while); others may see them later.</li>" : ""}<li><b>Eventual</b>: replicas converge; a read may be a few seconds stale.</li></ul>`,
+      ui: (I) => ({ items: I.items.map((x) => x.t), cats: I.lv === 1 ? ["Strong", "Eventual"] : ["Strong", "Read-your-writes", "Eventual"], live: (a) => { if (!a) return ""; const cats = I.lv === 1 ? ["strong", "eventual"] : ["strong", "ryw", "eventual"]; const s = a.filter((x) => cats[x] === "strong").length; return a.some((x) => x < 0) ? "" : K.metrics([{ name: "Coordinated operations", value: `${s} of ${a.length}`, ok: null, target: "each adds ~100 ms and fails during a partition" }]); } }),
+      ans: (I) => { const cats = I.lv === 1 ? ["strong", "eventual"] : ["strong", "ryw", "eventual"]; return I.items.map((x) => cats.indexOf(x.c)); },
+      diag: (I, a) => { const cats = I.lv === 1 ? ["strong", "eventual"] : ["strong", "ryw", "eventual"]; const wrong = I.items.map((x, i) => (cats.indexOf(x.c) !== a[i] ? i : -1)).filter((i) => i >= 0); const unsafe = wrong.find((i) => a[i] > cats.indexOf(I.items[i].c)); return `${wrong.length} feature${wrong.length === 1 ? " is" : "s are"} misclassified.${unsafe != null ? ` At least one is too weak: think about what goes wrong when two people do it at the same moment, or when someone reloads right after a change.` : " Some are stronger than they need to be, which costs latency and availability."}`; },
+      hint: (I) => I.lv === 1 ? "Ask: if two requests race, or a replica is a few seconds behind, does anything break that can't be fixed later?" : I.lv === 2 ? "Read-your-writes is for things a user changes and immediately looks at themselves; nobody else needs to see it instantly." : "A display can be stale if the decision that matters is re-checked strongly somewhere else.",
+      concept: "Per-feature consistency",
+      how: "Consistency is a per-operation choice, not a system-wide one. Operations that enforce an invariant under concurrency (uniqueness, non-negative balances, the last unit of stock, a single leader) need linearizable, coordinated writes. Most user-facing reads only need read-your-writes: the author must see their own change immediately, typically by pinning their reads to the primary or a replica that has caught up to their last write. Counters, feeds, recommendations and analytics tolerate staleness and benefit from local, cheap, always-available reads. A stale display is fine when the decision is re-validated strongly at the point of commit.",
+      rule: "Pay for strong consistency only where an invariant is enforced; give authors read-your-writes; let everything else be eventual, and re-check at commit time.",
+      why: (I) => `<ul>${I.items.map((x) => `<li>${esc(x.t)}: <b>${{ strong: "Strong", ryw: "Read-your-writes", eventual: "Eventual" }[x.c]}</b></li>`).join("")}</ul>`,
+    },
+    {
+      id: "sd-shed-load",
+      name: "Shed features to survive the spike",
+      kind: "Decision",
+      skills: ["design", "comms"],
+      w: "select",
+      gen(lv, R) {
+        const pool = U.range(SHED.length).filter((k) => !SHED[k].lv || SHED[k].lv <= lv);
+        return { lv, feats: R.shuffle(pool), fixed: 0, x: lv === 1 ? R.pick([1.15, 1.2]) : lv === 2 ? R.pick([1.4, 1.5]) : R.pick([1.7, 1.8]), app: R.pick(APPS) };
+      },
+      text: (I) => `<p>${I.app}'s launch is drawing <b>${K.num(I.x, 2)}×</b> the forecast traffic and there's no time to add capacity. The table shows each feature's share of fleet capacity at the forecast (they add up to ${K.num(I.feats.reduce((s, k) => s + SHED[k].load, 0))}%). Keep the fleet at <b>≤ 85%</b> so p99 holds.</p>${K.table(["Feature", "Capacity at forecast", "Business value"], I.feats.map((k) => [esc(SHED[k].t) + (SHED[k].core ? " (core)" : ""), SHED[k].load + "%", SHED[k].core ? "core" : String(SHED[k].v)]), { compact: true })}<p>Select the features to <b>shed or degrade</b> so the fleet fits, losing as little value as possible.</p>`,
+      ui: (I) => ({ opts: I.feats.map((k) => SHED[k].t), allowNone: true, live: (sel) => { const r = shedSim(I, sel || []); return K.metrics([{ name: "Fleet utilisation", value: pc(r.util), ok: r.util <= 0.85, target: "≤ 85%" }, { name: "Estimated p99", value: K.ms(r.p99), ok: r.util <= 0.85 }, { name: "Value lost", value: String(r.lost), ok: null }]) + (r.fail ? K.note(esc(r.fail), "bad") : ""); } }),
+      valid: (I, sel) => shedSim(I, sel).fail || true,
+      val: (I, sel) => shedSim(I, sel).lost,
+      sense: "min",
+      vname: "a value loss of",
+      hint: (I) => I.lv === 1 ? "Find how much capacity you must free, then the cheapest-value features that free it." : I.lv === 2 ? "It's a knapsack: compare value lost per percent of capacity freed." : "Degraded modes keep most of a feature's value for little capacity. Count them first.",
+      concept: "Graceful degradation",
+      how: "When demand exceeds capacity, either everything gets slow and fails together, or you deliberately turn off what matters least so the core keeps working. That requires features to be independently switchable (kill switches, feature flags) and a pre-agreed priority list. Degraded modes, such as cached search results, lower image quality or static recommendations, keep most of a feature's value at a fraction of its cost and are often better than switching it off. Shedding has to happen before the fleet saturates: past ~85% utilisation, queueing makes p99 explode for everything.",
+      rule: "Decide your shedding order before launch day: core flows never, degraded modes first, then the features with the least value per unit of capacity.",
+      why: (I, sol) => { const r = shedSim(I, sol); return `Shed: ${sol.map((i) => esc(SHED[I.feats[i]].t)).join(", ") || "nothing"} → ${pc(r.util)} utilisation, value lost ${r.lost}.`; },
+    },
+    {
+      id: "sd-edge-or-region",
+      name: "Edge or another region?",
+      kind: "Decision",
+      skills: ["design", "estimate"],
+      w: "tune",
+      sense: "min",
+      vname: "a monthly cost of",
+      vfmt: (x) => mo(x),
+      gen(lv, R) {
+        const eu = R.pick([85, 90, 95]), ap = R.pick([150, 160, 170]);
+        return { lv, app: R.pick(APPS), rtt: [{ US: R.pick([30, 35]), EU: eu + 10, APAC: ap + 20 }, { US: eu, EU: 25, APAC: 170 }, { US: ap, EU: 170, APAC: 25 }], toUS: { EU: eu - 5, APAC: ap - 10 }, readSlo: lv === 1 ? 350 : lv === 2 ? 200 : 140, writeSlo: lv === 3 ? 260 : 0, regionPrice: R.int(15, 25) * 1000, edgePrice: R.int(2, 5) * 1000 };
+      },
+      text: (I) => `<p>${I.app}'s API runs only in the US. A first request costs 3 round trips to wherever TLS terminates (TCP, TLS 1.3, request) + 40 ms of server time. A CDN edge terminates TLS ~15 ms from users and forwards over warm connections, so a request costs 2 × 15 ms + one round trip to the serving region + 40 ms.</p>${K.table(["Users", "→ US", "→ EU", "→ APAC"], ER_USERS.map((u, i) => [u, I.rtt[i].US + " ms", I.rtt[i].EU + " ms", I.rtt[i].APAC + " ms"]), { compact: true })}<p>Targets: first-request reads under <b>${I.readSlo} ms</b> for every user group${I.writeSlo ? `; writes (which must reach the single US primary: EU→US ${I.toUS.EU} ms, APAC→US ${I.toUS.APAC} ms from a regional deployment) under <b>${I.writeSlo} ms</b>` : ""}. Another region costs <b>${mo(I.regionPrice)}</b>; the edge costs <b>${mo(I.edgePrice)}</b>. Find the cheapest option.</p>`,
+      ui: (I) => ({ knobs: [{ k: "regions", label: "Regions", opts: Object.keys(ER_REG) }, { k: "edge", label: "Edge TLS termination", opts: ["off", "on"] }], init: { regions: "US only", edge: "off" }, live: (cfg) => { const r = erSim(I, cfg); return K.table(["Users", "Served from", "First read", ...(I.writeSlo ? ["Write"] : [])], r.res.map((x) => [x.u, x.s, `<span class="${x.read > I.readSlo ? "lose" : ""}">${x.read} ms</span>`, ...(I.writeSlo ? [`<span class="${x.write > I.writeSlo ? "lose" : ""}">${x.write} ms</span>`] : [])]), { compact: true }) + K.metrics([{ name: "Monthly cost", value: mo(r.cost), ok: null }]) + (r.fail ? K.note(esc(r.fail), "bad") : ""); } }),
+      valid: (I, cfg) => erSim(I, cfg).fail || true,
+      val: (I, cfg) => erSim(I, cfg).cost,
+      hint: (I) => I.lv === 1 ? "Most of the far users' latency is handshakes, not the request itself." : I.lv === 2 ? "The edge removes handshake round trips but not the last one to the region. Which users still miss the target with the edge alone?" : "Writes still go to the US primary. Which path to the primary is shortest: through a regional deployment, or straight from the edge?",
+      concept: "Latency: handshakes, edges and regions",
+      how: "A new HTTPS connection costs a TCP round trip plus a TLS 1.3 round trip before the request's own round trip, so a user 160 ms from your region waits ~500 ms before the server does anything. Terminating TLS at a nearby edge and reusing warm connections to the origin removes the long-distance handshakes: only one long round trip remains. A full region removes that last one for reads but costs a whole stack, and writes to a single primary still cross the ocean, sometimes via a longer path than the edge would take.",
+      rule: "Cut round trips before adding regions: terminate TLS at the edge, keep connections warm, and add a region only where the remaining one round trip still misses the target.",
+      why: (I, sol) => { const r = erSim(I, sol); return `Cheapest: ${sol.regions}, edge ${sol.edge}: ${r.res.map((x) => `${x.u} ${x.read} ms`).join(", ")}${I.writeSlo ? `; writes ${r.res.map((x) => `${x.u} ${x.write} ms`).join(", ")}` : ""}, ${mo(r.cost)}.`; },
+    },
+    {
+      id: "sd-launch-war-room",
+      name: "Launch day war room",
+      kind: "Capacity plan",
+      skills: ["tune", "diagnose", "estimate"],
+      ...LB.term({
+        shell: (I) => wrShell(I),
+        goal: (st, I) => {
+          if (I.lv < 3 && st.c.shed) return "Product vetoed shedding recommendations today: there's a cheaper capacity fix.";
+          const d = wrDay(I, st.c);
+          if (d.worst > I.slo || d.peakErr > 0.005) return `The launch-day replay still fails: worst p99 ${K.ms(d.worst)}, worst errors ${pc(d.peakErr)}.`;
+          const c = wrCost(I, st.c);
+          return c <= I.budget ? true : `The plan passes but costs ${mo(c)}, over the ${mo(I.budget)} budget.`;
+        },
+        solve: (I) => ({ log: I.solve }),
+      }),
+      gen(lv, R) {
+        const I = { lv, app: R.pick(APPS), peak: (lv === 1 ? R.int(15, 22) : lv === 2 ? R.int(24, 30) : R.int(26, 32)) * 1000, spike: lv === 3 ? 1.5 : 1.3, spikeAt: 18, apiCap: 900, dbCap: 6000, maxConn: lv === 1 ? 3000 : 1000, slo: 300, apiPrice: 250, repPrice: R.int(9, 12) * 100, gbPrice: 15 };
+        I.init = lv === 1 ? { api: R.int(10, 16), reps: 3, cache: 32, retries: "backoff-jitter-2x", shed: false } : lv === 2 ? { api: 36, reps: 2, cache: 0, retries: "backoff-jitter-2x", shed: false } : { api: 40, reps: 3, cache: 16, retries: "backoff-jitter-2x", shed: false };
+        const best = wrBest(I);
+        if (!best) return null;
+        I.budget = Math.ceil((best.cost * (lv === 1 ? 1.4 : lv === 2 ? 1.15 : 1.06)) / 100) * 100;
+        if (wrPass(I, I.init) && wrCost(I, I.init) <= I.budget) return null;
+        const b = best.c, log = ["launchctl simulate"];
+        if (b.retries !== I.init.retries) log.push("launchctl retries " + b.retries);
+        if (b.shed) log.push("launchctl shed recommendations");
+        if (b.cache !== I.init.cache) log.push("launchctl cache resize " + b.cache);
+        if (b.reps !== I.init.reps) log.push("launchctl db replicas " + b.reps);
+        if (b.api !== I.init.api) log.push("launchctl scale api " + b.api);
+        log.push("launchctl simulate");
+        I.solve = log;
+        return I;
+      },
+      bad: (I) => [{ log: ["launchctl scale api " + Math.min(200, Math.floor(I.maxConn / 20) + 10)] }, { log: ["launchctl db replicas 12", "launchctl scale api 60"] }],
+      text: (I) => `<p>${I.app} launches at ${SD.hm(I.spikeAt)}, during the evening peak. You own the capacity plan. Use <code>launchctl</code> to replay launch day against the plan and change it until the replay passes (<b>p99 ≤ ${I.slo} ms, errors ≤ 0.5%</b>) within a <b>${mo(I.budget)}/month</b> budget.${I.lv === 3 ? " Recommendations may be shed if that's the only way to fit the budget." : ""}</p><p>Prices: API replica ${mo(I.apiPrice)}, DB read replica ${mo(I.repPrice)}, cache ${K.usd(I.gbPrice)}/GB-month.</p>`,
+      hint: (I) => I.lv === 1 ? "Simulate first, then fix the tier that saturates." : I.lv === 2 ? "Each API replica opens 20 DB connections and max_connections is limited. If the database is the bottleneck, more API replicas make it worse; take reads off it instead." : "Price out the cheapest pure-capacity fix first. If it can't fit the budget, what does shedding recommendations remove from both the API and the database?",
+      concept: "Launch-day capacity planning",
+      how: "A launch plan is validated by replaying the expected traffic, including the launch spike on top of the organic peak, against every tier. The bottleneck moves: scaling the stateless tier pushes load onto the database and multiplies connections toward max_connections, so the fix is often to take reads off the database (cache, replicas). Client retry policy is part of capacity: immediate retries amplify load exactly when the system is struggling and can turn a brief overload into a collapse (a retry storm), while backoff, jitter and a retry budget cap amplification. Shedding a low-value feature is a legitimate lever when the budget is fixed.",
+      rule: "Replay the launch against the whole stack, fix the bottleneck tier rather than the one that's easiest to scale, make clients back off, and keep a shed list for when money runs out.",
+      why: (I) => `A plan that passes within budget: ${esc(I.solve.slice(1, -1).join("; ") || "no changes")}.${I.lv === 2 ? " The database, not the API, was saturated, and more API replicas would have exceeded max_connections." : I.lv === 3 ? " No capacity-only plan fits the budget: shedding recommendations removes a quarter of API work and a quarter of DB reads at once." : ""}`,
+    },
+    {
+      id: "sd-queue-smoothing",
+      name: "Smooth the peak with a queue",
+      kind: "Capacity plan",
+      skills: ["design", "tune"],
+      w: "tune",
+      sense: "min",
+      vname: "a monthly cost of",
+      vfmt: (x) => mo(x),
+      gen(lv, R) {
+        const peak = R.pick([120, 200, 300]);
+        return { lv, app: R.pick(APPS), peak, spike: R.pick([2, 2.5]), per: R.pick([10, 15, 20]), wh: Math.round(peak * R.pick([1.2, 1.5])), sla: lv === 1 ? 60 : lv === 2 ? 20 : 30, express: lv === 3 ? R.pick([0.1, 0.15]) : 0, xsla: 2, price: R.int(4, 8) * 10, qPrice: 50, lanePrice: R.int(1, 3) * 100 };
+      },
+      text: (I) => `<p>Every ${I.app} order must be sent to the warehouse API, which accepts <b>${K.num(I.wh)} orders/s</b> (429 above that). Orders peak at <b>${K.num(I.peak)}/s</b> in the evening and a noon promotion spikes them to <b>${K.num(I.peak * I.spike)}/s</b> for about an hour.</p><p>Checkout can call the warehouse synchronously, or publish to a queue that consumers drain (each sends <b>${I.per}/s</b>, ${mo(I.price)}; the queue costs ${mo(I.qPrice)}). Every order must reach the warehouse within <b>${I.sla} minutes</b>${I.express ? `; <b>express</b> orders (${pc(I.express)}) within <b>${I.xsla} minutes</b>. A separate priority lane for express orders costs ${mo(I.lanePrice)}` : ""}.</p><p>Find the cheapest setup.</p>`,
+      ui: (I) => {
+        const knobs = [{ k: "mode", label: "Integration", opts: ["synchronous call", "queue + consumers"] }, { k: "cons", label: "Consumers", opts: U.range(30).map((i) => i + 1) }];
+        if (I.express) knobs.push({ k: "lanes", label: "Queue layout", opts: ["one FIFO queue", "priority lane for express"] });
+        return { knobs, init: { mode: "synchronous call", cons: 4, lanes: "one FIFO queue" }, live: (cfg) => { const r = qsSim(I, cfg); return K.metrics([{ name: "Drain rate", value: cfg.mode === "synchronous call" ? "–" : K.num(r.out) + "/s", ok: null }, { name: "Oldest message", value: cfg.mode === "synchronous call" ? "–" : K.num(r.worst) + " min", ok: r.worst <= I.sla, target: `≤ ${I.sla} min` }, ...(I.express ? [{ name: "Express wait", value: r.worstX >= 99 ? "unbounded" : K.num(r.worstX) + " min", ok: r.worstX <= I.xsla, target: `≤ ${I.xsla} min` }] : []), { name: "Monthly cost", value: mo(r.cost), ok: null }]) + (cfg.mode === "synchronous call" ? "" : K.chart([{ name: "oldest message (min)", pts: r.age.map((v, i) => [i / 12, v]), cls: r.worst > I.sla ? "bad" : "s0" }], { h: 110, ymin: 0, hline: { y: I.sla, label: `SLA ${I.sla} min` }, title: "Queue age across the day", xfmt: SD.hm, fmt: (v) => K.num(v) })) + (r.fail ? K.note(esc(r.fail), "bad") : ""); } };
+      },
+      valid: (I, cfg) => qsSim(I, cfg).fail || true,
+      val: (I, cfg) => qsSim(I, cfg).cost + (cfg.mode === "synchronous call" ? 0 : 0),
+      hint: (I) => I.lv === 1 ? "A queue lets consumers run near the average rate instead of the peak, as long as the backlog drains within the SLA." : I.lv === 2 ? "Size consumers so the spike's backlog clears in time, but never above what the warehouse accepts." : "In one FIFO, express orders wait behind the whole backlog. Is a bigger fleet or a separate lane cheaper?",
+      concept: "Queues for load levelling",
+      how: "A queue between a spiky producer and a rate-limited consumer turns a peak into a backlog: consumers can be sized near the average rate, and the backlog drains after the spike, at the cost of delay. The maximum delay is roughly the peak backlog divided by the drain rate, so the SLA on message age sets how far below the peak you can provision. Consumers above the downstream limit just collect 429s. Priority lanes let urgent messages bypass the backlog without sizing the whole fleet for their deadline.",
+      rule: "Size consumers so the worst backlog drains within the age SLA, cap them at the downstream limit, and give urgent traffic its own lane instead of overprovisioning for it.",
+      why: (I, sol) => { const r = qsSim(I, sol); return sol.mode === "synchronous call" ? "Synchronous calls fit." : `Cheapest: ${sol.cons} consumers (${K.num(r.out)}/s)${I.express ? `, ${sol.lanes}` : ""}: the noon spike builds a backlog that peaks at ${K.num(r.worst)} min of age, ${mo(r.cost)}.`; },
+    },
+    {
+      id: "sd-dr-plan",
+      name: "Pick the disaster recovery plan",
+      kind: "Design review",
+      skills: ["design", "safe"],
+      w: "tune",
+      sense: "min",
+      vname: "a monthly cost of",
+      vfmt: (x) => mo(x),
+      gen(lv, R) {
+        const p = (a, b) => R.int(a, b) * 100;
+        return { lv, app: R.pick(APPS), tb: R.pick([2, 4, 6]), xrtt: R.pick([70, 80, 90]), rpoRegion: lv === 1 ? 3600 : lv === 2 ? 60 : 10, rtoRegion: lv === 1 ? 8 : lv === 2 ? 1 : 0.25, rpoLogical: lv === 1 ? 86400 : lv === 2 ? 900 : 300, rpoAz: lv === 3 ? 0 : 99999, writeBudget: lv === 3 ? 10 : 999, price: { backup: { "daily snapshots": p(1, 2), "hourly snapshots": p(3, 5), "continuous WAL archiving (PITR)": p(5, 8) }, replica: { none: 0, "async cross-region replica": p(20, 30), "sync standby in another AZ + async cross-region": p(40, 55), "sync cross-region replica": p(30, 40) }, standby: { "cold (provision on failover)": 0, "warm (scaled-down replica, scale up)": p(5, 10), "hot (full size, automated failover)": p(20, 30) } } };
+      },
+      text: (I) => `<p>${I.app}'s ${I.tb} TB Postgres needs a DR plan. Restoring from backups takes ~1 h per TB plus 30 min of WAL replay. Requirements:</p><ul><li>losing the region: RPO <b>${I.rpoRegion >= 3600 ? I.rpoRegion / 3600 + " h" : I.rpoRegion + " s"}</b>, RTO <b>${I.rtoRegion >= 1 ? I.rtoRegion + " h" : I.rtoRegion * 60 + " min"}</b></li><li>a bad migration that deletes rows (replicas copy the damage): RPO <b>${I.rpoLogical >= 3600 ? I.rpoLogical / 3600 + " h" : I.rpoLogical / 60 + " min"}</b></li>${I.lv === 3 ? `<li>losing the primary's AZ: <b>no acknowledged write lost</b>; writes may get at most <b>${I.writeBudget} ms</b> slower (cross-region RTT ${I.xrtt} ms)</li>` : ""}</ul><p>WAL archiving ships to the other region every 60 s; async replicas lag ~5 s. Pick the cheapest plan.</p>`,
+      ui: (I) => ({ knobs: [{ k: "backup", label: "Backups", opts: Object.keys(I.price.backup), select: true }, { k: "replica", label: "Replication", opts: Object.keys(I.price.replica), select: true }, { k: "standby", label: "Standby compute", opts: Object.keys(I.price.standby), select: true }], init: { backup: "daily snapshots", replica: "none", standby: "cold (provision on failover)" }, live: (cfg) => { const r = drSim(I, cfg); const f = (s) => (s >= 3600 ? s / 3600 + " h" : s >= 60 ? s / 60 + " min" : s + " s"); return K.metrics([{ name: "Region RPO", value: f(r.region), ok: r.region <= I.rpoRegion }, { name: "Region RTO", value: r.rto >= 1 ? K.num(r.rto, 1) + " h" : Math.round(r.rto * 60) + " min", ok: r.rto <= I.rtoRegion }, { name: "Bad-migration RPO", value: f(r.logical), ok: r.logical <= I.rpoLogical }, ...(I.lv === 3 ? [{ name: "AZ-loss RPO", value: f(r.az), ok: r.az === 0 }, { name: "Added write latency", value: r.writeAdd + " ms", ok: r.writeAdd <= I.writeBudget }] : []), { name: "Monthly cost", value: mo(r.cost), ok: null }]) + (r.fail ? K.note(esc(r.fail), "bad") : ""); } }),
+      valid: (I, cfg) => drSim(I, cfg).fail || true,
+      val: (I, cfg) => drSim(I, cfg).cost,
+      hint: (I) => I.lv === 1 ? "Daily backups lose up to a day; restore time grows with database size." : I.lv === 2 ? "Replicas protect against losing hardware, not against a bad DELETE: that needs point-in-time recovery." : "RPO 0 needs a synchronous copy, but a cross-region one blows the write budget. Where else can it live?",
+      concept: "RPO, RTO and the failures they cover",
+      how: "RPO is how much acknowledged data you can lose; RTO is how long recovery takes. Different failures need different mechanisms: replicas (async lose seconds, sync lose nothing but add the round trip to every commit) cover hardware, AZ and region loss; they faithfully replicate logical corruption, so a bad migration needs backups with point-in-time recovery (base backups plus continuous WAL archiving). RTO is set by what's waiting: restoring terabytes takes hours, a warm standby needs scaling up, a hot standby with automated failover takes minutes. Each step down in RPO/RTO multiplies cost, so match them to the business requirement per failure mode.",
+      rule: "List failure modes separately (AZ, region, logical corruption), give each an RPO/RTO, and buy the cheapest mechanism per row: sync replication nearby, async far away, PITR always.",
+      why: (I, sol) => { const r = drSim(I, sol); return `Cheapest plan: ${esc(sol.backup)}, ${esc(sol.replica)}, ${esc(sol.standby)}: ${mo(r.cost)}.`; },
+    },
+    {
+      id: "sd-cells",
+      name: "Size the cells",
+      kind: "Design review",
+      skills: ["design", "safe"],
+      w: "tune",
+      sense: "min",
+      vname: "a monthly cost of",
+      vfmt: (x) => mo(x),
+      gen(lv, R) {
+        return { lv, app: R.pick(APPS), users: R.pick([4, 8, 12]) * 1e6, fixed: R.int(3, 8) * 1000, perUser: 0.01, bake: R.pick([30, 45, 60]), deadline: lv === 1 ? 24 : R.pick([4, 6]), blast: lv === 1 ? R.pick([0.25, 0.15]) : R.pick([0.1, 0.07]), wave2: lv > 1 ? R.pick([0.25, 0.3]) : 0, whale: lv === 3 ? R.pick([0.025, 0.035, 0.04]) : 0 };
+      },
+      text: (I) => `<p>${I.app} is moving to a <b>cell-based architecture</b>: ${M(I.users)} users split across identical, independent cells (each with its own app tier and database), so one bad deploy, poison tenant or overloaded database hurts only one cell. Each cell has a fixed cost of <b>${mo(I.fixed)}</b> on top of per-user costs.</p><ul><li>One failed cell may affect at most <b>${pc(I.blast)}</b> of users.</li><li>Deploys go to one canary cell, then in waves; each wave bakes <b>${I.bake} min</b>. A full rollout must finish within <b>${I.deadline} h</b>.</li>${I.wave2 ? `<li>A bug noticed only after the second wave may reach at most <b>${pc(I.wave2)}</b> of users.</li>` : ""}${I.whale ? `<li>The largest tenant has <b>${pc(I.whale)}</b> of all users and must fit within half of one cell's capacity (cells have 30% headroom).</li>` : ""}</ul><p>Find the cheapest layout.</p>`,
+      ui: (I) => ({ knobs: [{ k: "cells", label: "Cells", opts: [1, 2, 4, 8, 12, 16, 24, 32, 48, 64] }, { k: "wave", label: "Cells per wave after the canary", opts: [1, 2, 3, 4, 6, 8, 16] }], init: { cells: 1, wave: 1 }, live: (cfg) => { const r = cellSim(I, cfg); return K.metrics([{ name: "Blast radius", value: pc(r.blast), ok: r.blast <= I.blast + 1e-9, target: `≤ ${pc(I.blast)}` }, ...(I.wave2 ? [{ name: "After wave 2", value: pc(r.wave2), ok: r.wave2 <= I.wave2 + 1e-9, target: `≤ ${pc(I.wave2)}` }] : []), { name: "Rollout time", value: `${K.num(r.hours, 1)} h (${r.waves} waves)`, ok: r.hours <= I.deadline, target: `≤ ${I.deadline} h` }, { name: "Monthly cost", value: mo(r.cost), ok: null }]) + (r.fail ? K.note(esc(r.fail), "bad") : ""); } }),
+      valid: (I, cfg) => cellSim(I, cfg).fail || true,
+      val: (I, cfg) => cellSim(I, cfg).cost,
+      hint: (I) => I.lv === 1 ? "Blast radius is 1 ÷ cells; each cell has a fixed cost." : I.lv === 2 ? "More cells mean more waves; bigger waves mean more users hit before you notice. Find a cell count where some wave size satisfies both." : "The whale puts an upper bound on the number of cells. Check it against the lower bound from the blast radius.",
+      concept: "Cell-based architecture",
+      how: "Cells are complete, isolated copies of a service, each serving a fixed slice of customers through a thin routing layer. They bound the blast radius of bad deploys, poison tenants and noisy neighbours to one cell, and let you roll out progressively cell by cell. More, smaller cells shrink the blast radius but add fixed per-cell cost and more deployment waves; bigger waves speed rollouts but expose more users before a problem is caught. The largest customer must still fit in a cell, which caps how small cells can be.",
+      rule: "Pick the cell count from the blast radius you can tolerate, bounded above by your biggest tenant, then choose wave sizes that meet the rollout deadline without exposing too much before the bake catches problems.",
+      why: (I, sol) => { const r = cellSim(I, sol); return `Cheapest: ${sol.cells} cells, ${sol.wave} per wave: blast radius ${pc(r.blast)}, rollout ${K.num(r.hours, 1)} h, ${mo(r.cost)}.`; },
+    },
+    {
+      id: "sd-spof-hunt",
+      name: "Find the single points of failure",
+      kind: "Design review",
+      skills: ["diagnose", "design"],
+      w: "topo",
+      gen(lv, R) { return { lv, order: R.shuffle(U.range(SPOF_POOL[lv].length)) }; },
+      text: (I) => `<p>Before launch, the reliability review asks: <b>which single component failure takes checkout down</b> (for more than a minute)? Every component below is on the checkout path; the small print on each box says how it's deployed.</p><p>Click every component that is a single point of failure for checkout.</p>`,
+      ui: (I) => { const ns = spofNodes(I), rows = Math.ceil(ns.length / 3); return { nodes: ns.map((n, i) => ({ label: n.label, sub: n.sub, x: 140 + (i % 3) * 200, y: 150 + (Math.floor(i / 3) - (rows - 1) / 2) * 95 })), links: [], mode: "nodes", nodeVerb: "flagged", bw: 164, W: 720, H: 300 }; },
+      ans: (I) => ({ down: spofNodes(I).map((n, i) => (n.spof ? i : -1)).filter((i) => i >= 0), cut: [] }),
+      diag: (I, a) => { const want = spofNodes(I).map((n, i) => (n.spof ? i : -1)).filter((i) => i >= 0); const d = a.down || []; const hit = d.filter((i) => want.includes(i)).length; return `${hit} of your ${d.length} flags are real SPOFs, and you found ${hit} of ${want.length}. Read the deployment notes: a replica that clients can't fail over to, or a manual failover, doesn't count as redundancy.`; },
+      hint: (I) => I.lv === 1 ? "Look for anything with exactly one instance that checkout can't do without." : I.lv === 2 ? "Redundancy in one zone isn't redundancy; a single instance behind a cache that fails open isn't fatal." : "Three nodes don't help if clients can't find the new one, and a failover that needs a human is an outage.",
+      concept: "Single points of failure",
+      how: "A SPOF is any component whose single failure stops the critical path. Counting replicas isn't enough: the redundancy must be reachable (clients follow a failover, not a hard-coded address), automatic (a manual 30-minute failover is an outage), independent (two instances in one zone share fate), and still needed (a dependency that's cached and fails open, or only used asynchronously, isn't on the critical path). Hidden SPOFs hide in plumbing: NAT gateways, certificate authorities, DNS, config services and secrets stores.",
+      rule: "Walk the critical path component by component and ask what happens in the first minute after it dies: if the answer is 'someone has to do something', it's a SPOF.",
+      why: (I) => `<ul>${spofNodes(I).filter((n) => n.spof).map((n) => `<li><b>${esc(n.label)}</b>: ${esc(n.why)}</li>`).join("")}</ul>`,
+    },
+    {
+      id: "sd-notify-pipeline",
+      name: "Order the notification pipeline",
+      kind: "Design review",
+      skills: ["design", "safe"],
+      w: "steps",
+      gen(lv, R) { return { lv, app: R.pick(APPS), order: R.shuffle(U.range(NP_ALL(lv).length)) }; },
+      text: (I) => `<p>${I.app}'s notification service turns events (order shipped, new follower, weekly promo${I.lv === 3 ? ", login code, new-device alert" : ""}) into push notifications. Events are delivered at least once. ${I.lv > 1 ? "Marketing must respect each user's quiet hours and a daily cap. " : ""}${I.lv === 3 ? "Security messages and one-time passcodes must always go out immediately. " : ""}Build the per-message pipeline in order; leave out steps that would do the wrong thing.</p>`,
+      ui: (I) => ({ opts: I.order.map((k) => NP_ALL(I.lv)[k].t) }),
+      accept: (I, seq) => npCheck(I, seq),
+      solve: (I) => NP_REQ(I.lv).map((id) => I.order.findIndex((k) => NP_ALL(I.lv)[k].id === id)),
+      bad: (I) => { const ix = (id) => I.order.findIndex((k) => NP_ALL(I.lv)[k].id === id); const req = NP_REQ(I.lv).map(ix); return [[ix("x1"), ...req.filter((i) => i !== ix("prefs"))], req.slice().reverse(), req.slice(1)]; },
+      hint: (I) => I.lv === 1 ? "Cheap filters first (duplicates, opt-outs), expensive work (rendering, sending) last." : I.lv === 2 ? "Deferring is not dropping, and 'night' depends on where the user is." : "Which messages must never be delayed or capped, and where do they leave the marketing path?",
+      concept: "Notification pipelines",
+      how: "Notification systems sit between at-least-once event streams and users who hate spam. The pipeline deduplicates by event ID first (producers retry), then applies preferences and opt-outs before doing any expensive work. Policies like quiet hours (in the user's local time) and frequency caps defer or drop marketing messages, while transactional messages such as passcodes and security alerts bypass them. Sending uses an idempotency key and retries only transient failures; permanent errors like unregistered tokens must clean up the token instead.",
+      rule: "Dedupe, filter, then decide when (quiet hours, caps, with transactional bypass), then render and send idempotently; treat permanent errors as data, not retries.",
+      why: (I) => `Reference pipeline: ${NP_REQ(I.lv).map((id) => esc(NP_STEPS.find((s) => s.id === id).t.split(":")[0].split(" (")[0])).join(" → ")}.`,
+    },
+    {
+      id: "sd-degrade-modes",
+      name: "Plan failure behaviour per dependency",
+      kind: "Hardening",
+      skills: ["design", "safe"],
+      w: "classify",
+      gen(lv, R) {
+        const by = [0, 1, 2, 3].map((c) => DM.filter((d) => d[1] === c));
+        let items;
+        if (lv === 1) items = by.map((g) => R.pick(g));
+        else if (lv === 2) items = [...R.sample(by[0], 2), ...R.sample(by[1].filter((d) => !/Fraud/.test(d[0])), 1), ...R.sample(by[2], 2), ...R.sample(by[3], 1)];
+        else items = [DM[3], DM[6], ...R.sample(by[0].filter((d) => !/Fraud/.test(d[0])), 1), ...R.sample(by[1].filter((d) => !/Fraud/.test(d[0])), 1), ...R.sample(by[2], 2), ...R.sample(by[3], 2)];
+        return { lv, items: R.shuffle(items) };
+      },
+      text: (I) => `<p>The resilience review asks each team to declare what happens when a dependency fails, so the behaviour is designed rather than accidental. For each failure, choose the response:</p><ul><li><b>Fail closed</b>: refuse the operation (safety or money is at stake).</li><li><b>Fail open</b>: carry on without the dependency.</li><li><b>Serve stale</b>: use the last known good data.</li><li><b>Hide feature</b>: drop that part of the page.</li></ul>`,
+      ui: (I) => ({ items: I.items.map((d) => d[0]), cats: ["Fail closed", "Fail open", "Serve stale", "Hide feature"] }),
+      ans: (I) => I.items.map((d) => d[1]),
+      diag: (I, a) => { const wrong = I.items.filter((d, i) => d[1] !== a[i]).length; const openBad = I.items.some((d, i) => d[1] === 0 && a[i] !== 0); return `${wrong} answer${wrong === 1 ? " is" : "s are"} off.${openBad ? " Something that protects security or money is not failing closed." : ""}`; },
+      hint: (I) => I.lv === 1 ? "Who gets hurt if you carry on: the user, the business, or nobody?" : I.lv === 2 ? "'Serve stale' needs a last-known-good copy and a later step that re-validates; 'hide' is for nice-to-haves." : "The same dependency can need different answers depending on the stakes: read the policy in each line.",
+      concept: "Fail open, fail closed, serve stale, hide",
+      how: "Every dependency call needs a designed failure mode. Security and money checks (authentication, authorisation, payment, high-value fraud) fail closed, because carrying on is worse than an error. Protective or observational systems (rate limiters, analytics) usually fail open, with alerts, so they can't take the product down. Data that changes slowly or is re-validated later (catalog prices re-checked at checkout, flags, config, FX estimates) is served from the last known good copy. Optional page components are hidden. The same dependency may need different policies depending on the stakes, like fraud checks on small vs large orders.",
+      rule: "Fail closed on security and money, fail open on protective and observational systems, serve stale what is re-validated later, and hide what is optional; write it down per dependency and test it.",
+      why: (I) => `<ul>${I.items.map((d) => `<li>${esc(d[0])}: <b>${["Fail closed", "Fail open", "Serve stale", "Hide feature"][d[1]]}</b></li>`).join("")}</ul>`,
+    },
+  ]);
 })();

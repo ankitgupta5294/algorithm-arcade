@@ -66,13 +66,13 @@
   }
   LB.knobValues = (kb) => kb.fixed != null && !kb.opts && kb.min == null ? [kb.fixed] : kb.opts ? kb.opts.slice() : U.range(Math.floor((kb.max - kb.min) / kb.step + 1e-9) + 1).map((i) => +(kb.min + i * kb.step).toFixed(6));
   function* tuneSpace(spec) {
-    const ks = spec.knobs.filter((kb) => !kb.fixed), vals = ks.map(LB.knobValues);
+    const ks = spec.knobs.filter((kb) => kb.fixed == null), vals = ks.map(LB.knobValues);
     let total = 1; vals.forEach((v) => (total *= v.length));
     if (total > 300000) throw new Error("tune space too large to enumerate; give solve()");
     for (const t of tuples(ks.length, Math.max(1, ...vals.map((v) => v.length)))) {
       if (t.some((x, i) => x >= vals[i].length)) continue;
       const cfg = { ...(spec.init || {}) };
-      spec.knobs.forEach((kb) => { if (kb.fixed) cfg[kb.k] = kb.fixed; });
+      spec.knobs.forEach((kb) => { if (kb.fixed != null) cfg[kb.k] = kb.fixed; });
       ks.forEach((kb, i) => (cfg[kb.k] = vals[i][t[i]]));
       yield cfg;
     }
