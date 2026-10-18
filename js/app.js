@@ -30,6 +30,7 @@
   });
 
   const GROUPS = [
+    { id: "Ranked", note: "Race rivals for promotion. Your rank is a job level and an estimated pay band." },
     { id: "Engineering", note: "Real-world systems scenarios: debug, tune, design and ship against simulators." },
     { id: "Drills", note: "Hand-written problems, rotated so you see new ones first." },
     { id: "Simulators", note: "Generated fresh every round, so they never run out." },
